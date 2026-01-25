@@ -1,0 +1,7 @@
+fastpi
+uvicorn[standard]
+python-dotenv
+supabase
+openai
+opik
+requests
