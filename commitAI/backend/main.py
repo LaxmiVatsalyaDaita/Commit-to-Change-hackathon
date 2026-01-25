@@ -55,12 +55,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # -------------------------
 app = FastAPI(title="commitAI API")
 
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://committochange.vercel.app",  # ✅ no trailing slash
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
