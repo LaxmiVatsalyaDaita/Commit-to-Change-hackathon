@@ -334,6 +334,76 @@ def _safe_opik_update_trace(*, input_obj: dict, output_obj: dict, metadata: dict
         return
 
 
+def schedule_calendar_from_steps(
+    *,
+    user_id: str,
+    steps: List[dict],
+    start_in_minutes: int,
+    sb: Client,
+    goal_id: Optional[str] = None,
+    agent_run_id: Optional[str] = None,
+) -> tuple[list, Optional[str]]:
+    calendar_events = []
+    calendar_error = None
+
+    try:
+        if ZoneInfo:
+            now_local = datetime.now(ZoneInfo("America/Detroit"))
+            tz_name = "America/Detroit"
+        else:
+            now_local = datetime.now(timezone.utc)
+            tz_name = "UTC"
+
+        cursor = now_local + timedelta(minutes=int(start_in_minutes or 5))
+
+        for s in steps:
+            mins = int(s.get("minutes", 25))
+            if mins < 10:
+                # Don’t create noisy 2–5 min events
+                continue
+
+            start_dt = cursor
+            end_dt = cursor + timedelta(minutes=mins)
+
+            evt = google_create_event(
+                user_id=user_id,
+                title=f"commitAI: {s.get('title', 'Task')}",
+                details=s.get("details", ""),
+                start=start_dt,
+                end=end_dt,
+                time_zone=tz_name,
+            )
+
+            calendar_events.append({
+                "step_title": s.get("title"),
+                "event_id": evt.get("id"),
+                "htmlLink": evt.get("htmlLink"),
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+            })
+
+            # ✅ add breathing room between blocks
+            cursor = end_dt + timedelta(minutes=10)
+
+        # ledger (optional)
+        if agent_run_id and goal_id:
+            sb.table("actions").insert({
+                "user_id": user_id,
+                "goal_id": goal_id,
+                "agent_run_id": agent_run_id,
+                "kind": "calendar_create_events",
+                "payload": {"steps": steps},
+                "status": "done",
+                "result": {"calendar_events": calendar_events},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+
+    except Exception as e:
+        calendar_error = str(e)
+
+    return calendar_events, calendar_error
+
+
 # -------------------------
 # Preference + policy + memory
 # -------------------------
