@@ -117,6 +117,34 @@ class CriticReview(BaseModel):
     issues: List[str] = []
     suggested_edits: List[str] = []
 
+# -------------------------
+# Models (Daily Autopilot)
+# -------------------------
+class RunDailyAutopilotRequest(BaseModel):
+    user_id: str
+    energy: int = Field(ge=1, le=5)
+    workload: int = Field(ge=1, le=5)
+    blockers: Optional[str] = None
+    schedule_calendar: bool = False
+    start_in_minutes: int = Field(default=5, ge=0, le=180)
+
+class DailyPlanStep(BaseModel):
+    goal_id: str
+    goal_title: str
+    title: str
+    minutes: int = Field(ge=1, le=90)
+    details: str
+
+class DailyAutopilotResult(BaseModel):
+    date: str  # YYYY-MM-DD
+    summary: str
+    total_minutes: int
+    steps: List[DailyPlanStep]
+    per_goal: List[dict] = []  # traceability for judges (state/agent per goal)
+    calendar_events: List[dict] = []
+    calendar_error: Optional[str] = None
+
+
 
 # -------------------------
 # Helpers
@@ -212,6 +240,69 @@ def _validate_plan_json(text: str) -> dict:
     out = plan.model_dump() if hasattr(plan, "model_dump") else plan.dict()
     out["total_minutes"] = sum(int(s["minutes"]) for s in out["steps"])
     return out
+
+def _today_iso_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+def merge_goal_plans_round_robin(
+    goal_plans: List[dict],
+    *,
+    per_goal_step_cap: int = 2,
+    max_total_minutes: int = 90,
+    hard_max_steps: int = 10,
+) -> dict:
+    """
+    goal_plans item format:
+      {
+        "goal": {"id":..., "title":...},
+        "result": {"steps":[{"title","minutes","details"}], "summary", "state", "selected_agent"...}
+      }
+    Returns: {"steps": [...], "total_minutes": int, "summary": str}
+    """
+
+    # Trim per-goal steps
+    buckets: List[List[dict]] = []
+    for gp in goal_plans:
+        g = gp["goal"]
+        steps = (gp["result"].get("steps") or [])[:per_goal_step_cap]
+        tagged = []
+        for s in steps:
+            tagged.append({
+                "goal_id": g["id"],
+                "goal_title": g.get("title") or "Goal",
+                "title": s.get("title") or "Task",
+                "minutes": int(s.get("minutes") or 25),
+                "details": s.get("details") or "",
+            })
+        buckets.append(tagged)
+
+    merged: List[dict] = []
+    total = 0
+
+    # Round robin interleave
+    idx = 0
+    while len(merged) < hard_max_steps:
+        progressed = False
+        for b in buckets:
+            if idx < len(b):
+                candidate = b[idx]
+                m = int(candidate["minutes"])
+                if total + m <= max_total_minutes:
+                    merged.append(candidate)
+                    total += m
+                progressed = True
+                if len(merged) >= hard_max_steps:
+                    break
+        if not progressed:
+            break
+        idx += 1
+
+    # Summary
+    goal_titles = [gp["goal"].get("title") for gp in goal_plans if gp.get("goal")]
+    goal_titles = [t for t in goal_titles if t]
+    summary = f"Today’s routine balances: " + ", ".join(goal_titles[:4]) + ("…" if len(goal_titles) > 4 else "")
+
+    return {"steps": merged, "total_minutes": total, "summary": summary}
 
 
 def _validate_critic_json(text: str) -> dict:
