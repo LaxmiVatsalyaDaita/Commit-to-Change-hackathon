@@ -1245,8 +1245,107 @@ def run_autopilot(req: RunAutopilotRequest):
             "calendar_events": calendar_events,
             "calendar_error": calendar_error,
         }
+        
+        
 
     except (ValidationError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+    
+@app.post("/api/run_daily_autopilot")
+def run_daily_autopilot(req: RunDailyAutopilotRequest):
+    try:
+        # 1) Load all goals for this user
+        goals = (
+            sb.table("goals")
+            .select("id,title,cadence_per_day")
+            .eq("user_id", req.user_id)
+            .order("created_at", desc=False)
+            .execute()
+            .data
+            or []
+        )
+
+        if not goals:
+            return {
+                "date": _today_iso_utc(),
+                "summary": "No goals found. Create a goal first.",
+                "total_minutes": 0,
+                "steps": [],
+                "per_goal": [],
+                "calendar_events": [],
+                "calendar_error": None,
+            }
+
+        # 2) Run your existing per-goal agent loop for each goal
+        goal_plans = []
+        per_goal_trace = []
+
+        for g in goals:
+            goal_id = g["id"]
+
+            req_payload = {
+                "user_id": req.user_id,
+                "goal_id": goal_id,
+                "checkin_id": None,
+                "energy": req.energy,
+                "workload": req.workload,
+                "blockers": req.blockers,
+                "completed": False,  # daily autopilot assumes "not done yet"
+                "schedule_calendar": req.schedule_calendar,
+                "start_in_minutes": req.start_in_minutes,
+            }
+
+            memory = build_memory(sb, req.user_id, goal_id)
+            context = {"goal": g, "today": req_payload, "memory": memory}
+
+            result = run_agent_loop(req_payload=req_payload, context=context)
+
+            goal_plans.append({"goal": g, "result": result})
+            per_goal_trace.append({
+                "goal_id": goal_id,
+                "goal_title": g.get("title"),
+                "state": result.get("state"),
+                "selected_agent": result.get("selected_agent"),
+                "iterations": result.get("iterations"),
+            })
+
+        # 3) Merge into one daily routine
+        merged = merge_goal_plans_round_robin(
+            goal_plans,
+            per_goal_step_cap=2,
+            max_total_minutes=90,
+            hard_max_steps=10,
+        )
+
+        daily_steps = merged["steps"]
+
+        # 4) (Optional) Schedule calendar from merged routine
+        calendar_events = []
+        calendar_error = None
+
+        if req.schedule_calendar and daily_steps:
+            calendar_events, calendar_error = schedule_calendar_from_steps(
+                user_id=req.user_id,
+                steps=daily_steps,
+                start_in_minutes=req.start_in_minutes,
+                sb=sb,
+                # no agent_run_id here unless you also create a daily_runs row (optional)
+            )
+
+        # 5) Return
+        return {
+            "date": _today_iso_utc(),
+            "summary": merged["summary"],
+            "total_minutes": merged["total_minutes"],
+            "steps": daily_steps,
+            "per_goal": per_goal_trace,
+            "calendar_events": calendar_events,
+            "calendar_error": calendar_error,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+

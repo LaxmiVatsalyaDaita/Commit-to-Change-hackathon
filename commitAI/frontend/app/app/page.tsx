@@ -22,27 +22,27 @@ type Checkin = {
   created_at: string;
 };
 
+type CalendarEvent = {
+  step_title: string;
+  event_id?: string | null;
+  htmlLink?: string | null;
+  start?: string;
+  end?: string;
+};
+
 type AutopilotResult = {
-    agent_run_id: string;
-    opik_trace_id?: string;   // add
-    state: string;
-    selected_agent: string;
-    summary: string;
-    steps: { title: string; minutes: number; details: string }[];
-    total_minutes: number;
+  agent_run_id: string;
+  opik_trace_id?: string;
+  state: string;
+  selected_agent: string;
+  summary: string;
+  steps: { title: string; minutes: number; details: string }[];
+  total_minutes: number;
 
+  calendar_events?: CalendarEvent[];
+  calendar_error?: string | null;
+};
 
-    calendar_events?: CalendarEvent[];
-    calendar_error?: string | null;
-  };
-
-  type CalendarEvent = {
-    step_title: string;
-    event_id?: string | null;
-    htmlLink?: string | null;
-    start?: string;
-    end?: string;
-  };  
 
   type RunRow = {
     id: string;
@@ -178,6 +178,8 @@ export default function AppHome() {
 
   const [recentRuns, setRecentRuns] = useState<RunRow[]>([]);
   const [loadingRuns, setLoadingRuns] = useState(false);
+
+  
 
 
 useEffect(() => {
@@ -550,7 +552,7 @@ useEffect(() => {
               </label>
             </div>
 
-            <label className="text-sm flex items-center gap-2 md:col-span-2">
+            {/* <label className="text-sm flex items-center gap-2 md:col-span-2">
               <input
                 type="checkbox"
                 checked={scheduleCalendar}
@@ -570,7 +572,7 @@ useEffect(() => {
                 onChange={(e) => setStartInMinutes(Number(e.target.value))}
                 disabled={!scheduleCalendar}
               />
-            </label>
+            </label> */}
 
             <label className="text-sm flex items-center gap-2 mt-3">
   <input
@@ -638,11 +640,32 @@ useEffect(() => {
     </ol>
 
     {/* ✅ ADD THIS RIGHT HERE */}
-    {(autopilot as any)?.calendar_error && (
-      <p className="mt-3 text-sm text-red-600">
-        Calendar error: {(autopilot as any).calendar_error}
-      </p>
-    )}
+    {autopilot.calendar_error && (
+  <p className="mt-3 text-sm text-red-600">
+    Calendar error: {autopilot.calendar_error}
+  </p>
+)}
+
+{autopilot.calendar_events && autopilot.calendar_events.length > 0 && (
+  <div className="mt-3 text-sm">
+    <div className="font-medium">Calendar events created:</div>
+    <ul className="list-disc list-inside">
+      {autopilot.calendar_events.map((e, i) => (
+        <li key={i}>
+          {e.step_title} —{" "}
+          {e.htmlLink ? (
+            <a className="underline" href={e.htmlLink} target="_blank" rel="noreferrer">
+              open
+            </a>
+          ) : (
+            e.event_id ?? "created"
+          )}
+        </li>
+      ))}
+    </ul>
+  </div>
+)}
+
 
     {(autopilot as any)?.calendar_events?.length > 0 && (
       <div className="mt-3 text-sm">
@@ -747,7 +770,7 @@ useEffect(() => {
   </div>
 )}
 
-<section className="mt-8 border rounded p-4">
+{/* <section className="mt-8 border rounded p-4">
   <h2 className="font-semibold">Calendar integration</h2>
 
   {!userId ? (
@@ -757,7 +780,7 @@ useEffect(() => {
       <CalendarIntegration userId={userId} />
     </div>
   )}
-</section>
+</section> */}
 
 
             <p className="mt-2 text-xs text-gray-600">
@@ -794,6 +817,18 @@ useEffect(() => {
             </div>
           </>
         )}
+      </section>
+
+      <section className="mt-8 border rounded p-4">
+        <h2 className="font-semibold">Calendar integration</h2>
+
+          {!userId ? (
+           <p className="mt-2 text-sm text-gray-600">Loading user…</p>
+         ) : (
+             <div className="mt-3">
+               <CalendarIntegration userId={userId} />
+             </div>
+          )}
       </section>
 
       <section className="mt-8 border rounded p-4">
