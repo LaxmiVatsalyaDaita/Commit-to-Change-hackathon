@@ -43,6 +43,31 @@ type AutopilotResult = {
   calendar_error?: string | null;
 };
 
+type DailyAutopilotResult = {
+  daily_run_id?: string;
+  summary: string;
+  items: {
+    title: string;
+    minutes: number;
+    details: string;
+    goal_ids: string[];
+    kind: string;
+    window: string;
+    occurrences?: number;
+    min_gap_minutes?: number;
+  }[];
+  schedule: {
+    title: string;
+    details: string;
+    goal_ids: string[];
+    kind: string;
+    start: string;
+    end: string;
+  }[];
+  calendar_events?: CalendarEvent[];
+  calendar_error?: string | null;
+};
+
 
   type RunRow = {
     id: string;
@@ -157,6 +182,8 @@ export default function AppHome() {
   const [savingCheckin, setSavingCheckin] = useState(false);
 
   const [autopilot, setAutopilot] = useState<AutopilotResult | null>(null);
+  const [dailyAutopilot, setDailyAutopilot] = useState<DailyAutopilotResult | null>(null);
+
   const [runningAutopilot, setRunningAutopilot] = useState(false);
 
 
@@ -413,6 +440,44 @@ useEffect(() => {
     }
   }
   
+  async function runDailyAutopilot() {
+    if (!userId) return;
+  
+    setRunningAutopilot(true);
+    setMsg(null);
+    setDailyAutopilot(null);
+  
+    try {
+      const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+  
+      const body = {
+        user_id: userId,
+        energy,
+        workload,
+        blockers: blockers.trim() ? blockers.trim() : null,
+        schedule_calendar: scheduleCalendar,
+        start_in_minutes: startInMinutes,
+        // optional: you can pass goal_ids: goals.map(g => g.id)
+      };
+  
+      const res = await fetch(`${base}/api/run_daily_autopilot`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+  
+      if (!res.ok) throw new Error(await res.text());
+  
+      const data = (await res.json()) as DailyAutopilotResult;
+      setDailyAutopilot(data);
+      setToast("✅ Daily plan created");
+    } catch (e: any) {
+      setMsg(e?.message ?? String(e));
+    } finally {
+      setRunningAutopilot(false);
+    }
+  }
+  
 
   return (
     <main className="p-8 max-w-3xl">
@@ -613,6 +678,15 @@ useEffect(() => {
   {runningAutopilot ? "Running Autopilot…" : "Run Autopilot"}
 </button>
 
+<button
+  className="mt-3 border rounded px-3 py-2 text-sm"
+  onClick={runDailyAutopilot}
+  disabled={runningAutopilot}
+>
+  {runningAutopilot ? "Running Daily Autopilot…" : "Run Daily Autopilot (All Goals)"}
+</button>
+
+
 {autopilot && (
   <div className="mt-4 border rounded p-4">
     <div className="flex items-center justify-between">
@@ -645,6 +719,37 @@ useEffect(() => {
     Calendar error: {autopilot.calendar_error}
   </p>
 )}
+
+{dailyAutopilot && (
+  <div className="mt-4 border rounded p-4">
+    <div className="font-semibold">Daily Autopilot Schedule</div>
+    <p className="mt-2 text-sm text-gray-600">{dailyAutopilot.summary}</p>
+
+    {dailyAutopilot.calendar_error && (
+      <p className="mt-3 text-sm text-red-600">
+        Calendar error: {dailyAutopilot.calendar_error}
+      </p>
+    )}
+
+    <ol className="mt-3 space-y-2">
+      {dailyAutopilot.schedule.map((b, i) => (
+        <li key={i} className="border rounded p-3">
+          <div className="font-medium">
+            {b.title}{" "}
+            <span className="text-xs text-gray-600">
+              ({new Date(b.start).toLocaleTimeString()} - {new Date(b.end).toLocaleTimeString()})
+            </span>
+          </div>
+          <div className="text-sm mt-1">{b.details}</div>
+          <div className="text-xs text-gray-600 mt-1">
+            kind: {b.kind} · goals: {b.goal_ids.length}
+          </div>
+        </li>
+      ))}
+    </ol>
+  </div>
+)}
+
 
 {autopilot.calendar_events && autopilot.calendar_events.length > 0 && (
   <div className="mt-3 text-sm">

@@ -116,6 +116,46 @@ class CriticReview(BaseModel):
     ok: bool
     issues: List[str] = []
     suggested_edits: List[str] = []
+    
+from typing import Literal
+
+class DailyAutopilotRequest(BaseModel):
+    user_id: str
+    # uses your existing checkin fields (one check-in drives the whole day)
+    energy: int = Field(ge=1, le=5)
+    workload: int = Field(ge=1, le=5)
+    blockers: Optional[str] = None
+
+    schedule_calendar: bool = False
+    start_in_minutes: int = Field(default=5, ge=0, le=180)
+    # optional override: if provided, plan only for these goals
+    goal_ids: Optional[List[str]] = None
+
+class DailyPlanItem(BaseModel):
+    title: str
+    minutes: int = Field(ge=1, le=180)
+    details: str
+    goal_ids: List[str] = Field(min_length=1)
+
+    kind: Literal["focus", "habit"] = "focus"
+    window: Literal["morning", "midday", "afternoon", "evening", "any"] = "any"
+
+    # only relevant for habits
+    occurrences: int = Field(default=1, ge=1, le=12)
+    min_gap_minutes: int = Field(default=60, ge=0, le=600)
+
+class DailyPlanOutput(BaseModel):
+    summary: str
+    items: List[DailyPlanItem] = Field(min_length=2, max_length=20)
+
+class ScheduledBlock(BaseModel):
+    title: str
+    details: str
+    goal_ids: List[str]
+    start: str
+    end: str
+    kind: str
+
 
 # -------------------------
 # Models (Daily Autopilot)
@@ -240,6 +280,17 @@ def _validate_plan_json(text: str) -> dict:
     out = plan.model_dump() if hasattr(plan, "model_dump") else plan.dict()
     out["total_minutes"] = sum(int(s["minutes"]) for s in out["steps"])
     return out
+
+def _validate_daily_plan_json(text: str) -> dict:
+    obj = _json_load_or_raise(text, "daily_planner")
+    for k in ("summary", "items"):
+        if k not in obj:
+            raise ValueError(f"daily_planner: missing '{k}'. raw={text[:800]}")
+
+    plan = DailyPlanOutput.model_validate(obj) if hasattr(DailyPlanOutput, "model_validate") else DailyPlanOutput.parse_obj(obj)
+    out = plan.model_dump() if hasattr(plan, "model_dump") else plan.dict()
+    return out
+
 
 def _today_iso_utc() -> str:
     return datetime.now(timezone.utc).date().isoformat()
@@ -634,6 +685,100 @@ def upsert_user_prefs(sb: Client, user_id: str, goal_id: str) -> dict:
     res = sb.table("user_prefs").upsert(row, on_conflict="user_id,goal_id").execute()
     return (res.data or [row])[0]
 
+def _day_window_bounds(now_local: datetime, window: str):
+    # simple fixed windows; you can refine later
+    y, m, d = now_local.year, now_local.month, now_local.day
+    if window == "morning":
+        return now_local.replace(hour=9, minute=0, second=0, microsecond=0), now_local.replace(hour=12, minute=0, second=0, microsecond=0)
+    if window == "midday":
+        return now_local.replace(hour=12, minute=0, second=0, microsecond=0), now_local.replace(hour=14, minute=0, second=0, microsecond=0)
+    if window == "afternoon":
+        return now_local.replace(hour=14, minute=0, second=0, microsecond=0), now_local.replace(hour=18, minute=0, second=0, microsecond=0)
+    if window == "evening":
+        return now_local.replace(hour=18, minute=0, second=0, microsecond=0), now_local.replace(hour=22, minute=0, second=0, microsecond=0)
+    # any
+    return now_local.replace(hour=9, minute=0, second=0, microsecond=0), now_local.replace(hour=22, minute=0, second=0, microsecond=0)
+
+
+def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_minutes: int, buffer_minutes: int = 5) -> List[dict]:
+    """
+    Deterministic scheduler:
+    - focus blocks: placed sequentially starting at cursor within their window
+    - habit blocks: spread across window/horizon with min_gap enforcement
+    """
+    cursor = now_local + timedelta(minutes=int(start_in_minutes or 0))
+    scheduled: List[dict] = []
+
+    # split
+    habits = [it for it in items if it.get("kind") == "habit" and int(it.get("occurrences", 1)) > 1]
+    focus = [it for it in items if it not in habits]
+
+    # 1) schedule focus sequentially
+    for it in focus:
+        w = it.get("window", "any")
+        w_start, w_end = _day_window_bounds(now_local, w)
+
+        start_dt = max(cursor, w_start)
+        end_dt = start_dt + timedelta(minutes=int(it.get("minutes", 25)))
+
+        # if it spills beyond window, just keep it (MVP) or clamp later
+        scheduled.append({
+            "title": it.get("title"),
+            "details": it.get("details", ""),
+            "goal_ids": it.get("goal_ids", []),
+            "kind": it.get("kind", "focus"),
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        })
+        cursor = end_dt + timedelta(minutes=buffer_minutes)
+
+    # helper: check min gap conflicts for same habit title
+    def _conflicts(title: str, t: datetime, min_gap: int):
+        for s in scheduled:
+            if s["title"] != title:
+                continue
+            st = datetime.fromisoformat(s["start"])
+            if abs((t - st).total_seconds()) < min_gap * 60:
+                return True
+        return False
+
+    # 2) schedule habits spread out
+    for it in habits:
+        w = it.get("window", "any")
+        w_start, w_end = _day_window_bounds(now_local, w)
+
+        occ = int(it.get("occurrences", 1))
+        min_gap = int(it.get("min_gap_minutes", 120))
+        dur = int(it.get("minutes", 2))
+
+        # horizon for spacing = from max(now,cursor,w_start) to w_end
+        start_base = max(now_local, cursor, w_start)
+        total_span = max(1, int((w_end - start_base).total_seconds() // 60))
+        step = max(min_gap, total_span // occ)
+
+        t = start_base
+        for _ in range(occ):
+            # find next non-conflicting slot
+            tries = 0
+            while _conflicts(it["title"], t, min_gap) and tries < 10:
+                t = t + timedelta(minutes=15)
+                tries += 1
+
+            scheduled.append({
+                "title": it.get("title"),
+                "details": it.get("details", ""),
+                "goal_ids": it.get("goal_ids", []),
+                "kind": it.get("kind", "habit"),
+                "start": t.isoformat(),
+                "end": (t + timedelta(minutes=dur)).isoformat(),
+            })
+            t = t + timedelta(minutes=step)
+
+    # sort by time
+    scheduled.sort(key=lambda x: x["start"])
+    return scheduled
+
+
 
 # -------------------------
 # Endpoints: runs + feedback
@@ -806,6 +951,70 @@ completed={req_payload.get("completed")}
     )
     text = resp.choices[0].message.content or "{}"
     return _validate_plan_json(text)
+
+
+@track(project_name=OPIK_PROJECT, name="daily_planner_llm", flush=True)
+def daily_planner_llm(req_payload: dict, goals: List[dict], memory: str) -> dict:
+    prompt = f"""
+You are CommitAI Daily Planner.
+
+You must produce ONE cohesive plan that covers ALL goals listed.
+
+Return ONLY valid JSON:
+{{
+  "summary": "...",
+  "items": [
+    {{
+      "title": "...",
+      "minutes": 25,
+      "details": "...",
+      "goal_ids": ["..."],
+      "kind": "focus" | "habit",
+      "window": "morning" | "midday" | "afternoon" | "evening" | "any",
+      "occurrences": 1,
+      "min_gap_minutes": 120
+    }}
+  ]
+}}
+
+Hard rules:
+- Every goal must appear in at least ONE item (goal_ids must include that goal's id).
+- Habits (like water) should be kind="habit" with occurrences>1 and min_gap_minutes>=90.
+- Focus work should be kind="focus" with realistic minutes.
+- JSON only. No extra keys. No markdown.
+
+User state:
+energy={req_payload.get("energy")}
+workload={req_payload.get("workload")}
+blockers={req_payload.get("blockers")}
+
+Goals (id/title/cadence):
+{json.dumps(goals)}
+
+Recent memory:
+{memory[:1500]}
+"""
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL or "gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+    text = resp.choices[0].message.content or "{}"
+    plan = _validate_daily_plan_json(text)
+
+    # enforce coverage (quick guardrail)
+    goal_ids = {g["id"] for g in goals if g.get("id")}
+    covered = set()
+    for it in plan.get("items", []):
+        for gid in it.get("goal_ids", []):
+            covered.add(gid)
+    missing = [gid for gid in goal_ids if gid not in covered]
+    if missing:
+        raise ValueError(f"daily_planner: missing goal coverage for goal_ids={missing}")
+
+    return plan
 
 
 @track(project_name=OPIK_PROJECT, name="critic_rule", flush=True)
@@ -1255,97 +1464,87 @@ def run_autopilot(req: RunAutopilotRequest):
     
     
 @app.post("/api/run_daily_autopilot")
-def run_daily_autopilot(req: RunDailyAutopilotRequest):
+def run_daily_autopilot(req: DailyAutopilotRequest):
     try:
-        # 1) Load all goals for this user
-        goals = (
-            sb.table("goals")
-            .select("id,title,cadence_per_day")
-            .eq("user_id", req.user_id)
-            .order("created_at", desc=False)
-            .execute()
-            .data
-            or []
-        )
+        # timezone
+        if ZoneInfo:
+            now_local = datetime.now(ZoneInfo("America/Detroit"))
+            tz_name = "America/Detroit"
+        else:
+            now_local = datetime.now(timezone.utc)
+            tz_name = "UTC"
 
+        # load goals (all or subset)
+        q = sb.table("goals").select("id,title,cadence_per_day").eq("user_id", req.user_id)
+        if req.goal_ids:
+            q = q.in_("id", req.goal_ids)
+        goals = q.execute().data or []
         if not goals:
-            return {
-                "date": _today_iso_utc(),
-                "summary": "No goals found. Create a goal first.",
-                "total_minutes": 0,
-                "steps": [],
-                "per_goal": [],
-                "calendar_events": [],
-                "calendar_error": None,
-            }
+            raise HTTPException(status_code=400, detail="No goals found for user")
 
-        # 2) Run your existing per-goal agent loop for each goal
-        goal_plans = []
-        per_goal_trace = []
+        # lightweight memory: reuse your existing memory but we just pick first goal_id (MVP)
+        # better later: build memory across all goals
+        memory = build_memory(sb, req.user_id, goals[0]["id"])
 
-        for g in goals:
-            goal_id = g["id"]
+        req_payload = _dump_model(req)
 
-            req_payload = {
-                "user_id": req.user_id,
-                "goal_id": goal_id,
-                "checkin_id": None,
-                "energy": req.energy,
-                "workload": req.workload,
-                "blockers": req.blockers,
-                "completed": False,  # daily autopilot assumes "not done yet"
-                "schedule_calendar": req.schedule_calendar,
-                "start_in_minutes": req.start_in_minutes,
-            }
-
-            memory = build_memory(sb, req.user_id, goal_id)
-            context = {"goal": g, "today": req_payload, "memory": memory}
-
-            result = run_agent_loop(req_payload=req_payload, context=context)
-
-            goal_plans.append({"goal": g, "result": result})
-            per_goal_trace.append({
-                "goal_id": goal_id,
-                "goal_title": g.get("title"),
-                "state": result.get("state"),
-                "selected_agent": result.get("selected_agent"),
-                "iterations": result.get("iterations"),
-            })
-
-        # 3) Merge into one daily routine
-        merged = merge_goal_plans_round_robin(
-            goal_plans,
-            per_goal_step_cap=2,
-            max_total_minutes=90,
-            hard_max_steps=10,
+        plan = daily_planner_llm(req_payload=req_payload, goals=goals, memory=memory)
+        schedule = schedule_daily_items(
+            plan["items"],
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
         )
 
-        daily_steps = merged["steps"]
+        # persist daily run
+        dr = sb.table("daily_runs").insert({
+            "user_id": req.user_id,
+            "run_date": now_local.date().isoformat(),
+            "state": "DAILY",
+            "selected_agent": "daily",
+            "summary": plan["summary"],
+            "plan_json": plan,
+            "schedule_json": schedule,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute().data
+        daily_run_id = (dr or [{}])[0].get("id")
 
-        # 4) (Optional) Schedule calendar from merged routine
+        # optional calendar scheduling from SCHEDULE (not items)
         calendar_events = []
         calendar_error = None
+        if req.schedule_calendar:
+            try:
+                for blk in schedule:
+                    start_dt = datetime.fromisoformat(blk["start"])
+                    end_dt = datetime.fromisoformat(blk["end"])
+                    evt = google_create_event(
+                        user_id=req.user_id,
+                        title=f"commitAI: {blk['title']}",
+                        details=blk.get("details", ""),
+                        start=start_dt,
+                        end=end_dt,
+                        time_zone=tz_name,
+                    )
+                    calendar_events.append({
+                        "step_title": blk["title"],
+                        "event_id": evt.get("id"),
+                        "htmlLink": evt.get("htmlLink"),
+                        "start": blk["start"],
+                        "end": blk["end"],
+                    })
+            except Exception as e:
+                calendar_error = str(e)
 
-        if req.schedule_calendar and daily_steps:
-            calendar_events, calendar_error = schedule_calendar_from_steps(
-                user_id=req.user_id,
-                steps=daily_steps,
-                start_in_minutes=req.start_in_minutes,
-                sb=sb,
-                # no agent_run_id here unless you also create a daily_runs row (optional)
-            )
-
-        # 5) Return
         return {
-            "date": _today_iso_utc(),
-            "summary": merged["summary"],
-            "total_minutes": merged["total_minutes"],
-            "steps": daily_steps,
-            "per_goal": per_goal_trace,
+            "daily_run_id": daily_run_id,
+            "summary": plan["summary"],
+            "items": plan["items"],
+            "schedule": schedule,
             "calendar_events": calendar_events,
             "calendar_error": calendar_error,
         }
 
+    except (ValidationError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
