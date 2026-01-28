@@ -30,13 +30,36 @@ type CalendarEvent = {
   end?: string;
 };
 
+// ✅ Shared plan types
+type PlanStep = { title: string; minutes: number; details: string };
+
+type DailyItem = {
+  title: string;
+  minutes?: number | null;
+  details?: string | null;
+  goal_ids?: string[];
+  kind?: string;
+  window?: string | null;
+  occurrences?: number;
+  min_gap_minutes?: number;
+};
+
+type DailyBlock = {
+  title: string;
+  details: string;
+  goal_ids?: string[];
+  kind: string;
+  start: string;
+  end: string;
+};
+
 type AutopilotResult = {
   agent_run_id: string;
   opik_trace_id?: string;
   state: string;
   selected_agent: string;
   summary: string;
-  steps: { title: string; minutes: number; details: string }[];
+  steps: PlanStep[];
   total_minutes: number;
 
   calendar_events?: CalendarEvent[];
@@ -46,47 +69,25 @@ type AutopilotResult = {
 type DailyAutopilotResult = {
   daily_run_id?: string;
   summary: string;
-  items: {
-    title: string;
-    minutes: number;
-    details: string;
-    goal_ids: string[];
-    kind: string;
-    window: string;
-    occurrences?: number;
-    min_gap_minutes?: number;
-  }[];
-  schedule: {
-    title: string;
-    details: string;
-    goal_ids: string[];
-    kind: string;
-    start: string;
-    end: string;
-  }[];
+  items: DailyItem[];
+  schedule: DailyBlock[];
   calendar_events?: CalendarEvent[];
   calendar_error?: string | null;
 };
 
-
-  type RunRow = {
-    id: string;
-    created_at: string;
-    state: string;
-    selected_agent: string;
-    summary: string;
-    opik_trace_id?: string;
-    feedback?: { helpful: boolean; comment?: string | null; created_at: string } | null;
-  };
-  
-  
-  
+type RunRow = {
+  id: string;
+  created_at: string;
+  state: string;
+  selected_agent: string;
+  summary: string;
+  opik_trace_id?: string;
+  feedback?: { helpful: boolean; comment?: string | null; created_at: string } | null;
+};
 
 function todayISODate() {
-  // Supabase `date` column expects YYYY-MM-DD
   return new Date().toISOString().slice(0, 10);
 }
-
 
 type CalendarStatus = {
   connected: boolean;
@@ -97,9 +98,6 @@ type CalendarStatus = {
 function CalendarIntegration({ userId }: { userId: string }) {
   const [status, setStatus] = useState<CalendarStatus | null>(null);
   const [loading, setLoading] = useState(false);
-  const [scheduleCalendar, setScheduleCalendar] = useState(false);
-  const [startInMinutes, setStartInMinutes] = useState(5);
-
 
   const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -123,7 +121,7 @@ function CalendarIntegration({ userId }: { userId: string }) {
       { cache: "no-store" }
     );
     const j = await r.json();
-    window.location.href = j.auth_url; // sends user to Google consent screen
+    window.location.href = j.auth_url;
   }
 
   useEffect(() => {
@@ -160,7 +158,6 @@ function CalendarIntegration({ userId }: { userId: string }) {
   );
 }
 
-
 export default function AppHome() {
   const router = useRouter();
 
@@ -186,7 +183,6 @@ export default function AppHome() {
 
   const [runningAutopilot, setRunningAutopilot] = useState(false);
 
-
   // form fields for check-in
   const [energy, setEnergy] = useState(3);
   const [workload, setWorkload] = useState(3);
@@ -206,18 +202,13 @@ export default function AppHome() {
   const [recentRuns, setRecentRuns] = useState<RunRow[]>([]);
   const [loadingRuns, setLoadingRuns] = useState(false);
 
-  
-
-
-useEffect(() => {
-  if (!toast) return;
-  const t = setTimeout(() => setToast(null), 2500);
-  return () => clearTimeout(t);
-}, [toast]);
-
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 2500);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   useEffect(() => {
-    // session gate
     supabase.auth.getSession().then(({ data }) => {
       const session = data.session;
       if (!session) router.replace("/auth");
@@ -263,7 +254,9 @@ useEffect(() => {
     setLoadingRuns(true);
     try {
       const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-      const res = await fetch(`${base}/api/runs/recent?user_id=${userId}&limit=10`, { cache: "no-store" });
+      const res = await fetch(`${base}/api/runs/recent?user_id=${userId}&limit=10`, {
+        cache: "no-store",
+      });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setRecentRuns(data.runs ?? []);
@@ -273,7 +266,6 @@ useEffect(() => {
       setLoadingRuns(false);
     }
   }
-  
 
   async function loadCheckins(goalId: string) {
     setLoadingCheckins(true);
@@ -302,14 +294,12 @@ useEffect(() => {
     const t = rows.find((r) => r.checkin_date === today) ?? null;
     setTodayCheckin(t);
 
-    // hydrate form from today's check-in if it exists
     if (t) {
       setEnergy(t.energy);
       setWorkload(t.workload);
       setBlockers(t.blockers ?? "");
       setCompleted(t.completed);
     } else {
-      // defaults if no check-in yet
       setEnergy(3);
       setWorkload(3);
       setBlockers("");
@@ -343,7 +333,7 @@ useEffect(() => {
     const { error } = await supabase.from("goals").insert({
       title: cleanTitle,
       cadence_per_day: cadence,
-      user_id: userId, // explicit, works with your RLS
+      user_id: userId,
     });
 
     setSavingGoal(false);
@@ -374,12 +364,9 @@ useEffect(() => {
       completed,
     };
 
-    // upsert using the unique constraint (user_id, goal_id, checkin_date)
-    const { error } = await supabase
-      .from("checkins")
-      .upsert(payload, {
-        onConflict: "user_id,goal_id,checkin_date",
-      });
+    const { error } = await supabase.from("checkins").upsert(payload, {
+      onConflict: "user_id,goal_id,checkin_date",
+    });
 
     setSavingCheckin(false);
 
@@ -393,15 +380,15 @@ useEffect(() => {
 
   async function runAutopilot() {
     if (!selectedGoal?.id || !userId) return;
-  
+
     setRunningAutopilot(true);
     setMsg(null);
     setAutopilot(null);
-  
+    setDailyAutopilot(null);
+
     try {
-      const base =
-        process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-  
+      const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+
       const body = {
         user_id: userId,
         goal_id: selectedGoal.id,
@@ -411,27 +398,24 @@ useEffect(() => {
         blockers: blockers.trim() ? blockers.trim() : null,
         completed,
         schedule_calendar: scheduleCalendar,
-        start_in_minutes: startInMinutes,      
+        start_in_minutes: startInMinutes,
       };
-  
+
       const res = await fetch(`${base}/api/run_autopilot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-  
+
       if (!res.ok) {
         const t = await res.text();
         throw new Error(`Backend error (${res.status}): ${t}`);
       }
-  
+
       const data = (await res.json()) as AutopilotResult;
       setAutopilot(data);
       await loadRecentRuns();
-      setToast("✅ Feedback saved ...");
-
-  
-      // Optional: refresh checkins list (not required, but keeps state fresh)
+      setToast("✅ Autopilot ran");
       await loadCheckins(selectedGoal.id);
     } catch (e: any) {
       setMsg(e?.message ?? String(e));
@@ -439,17 +423,18 @@ useEffect(() => {
       setRunningAutopilot(false);
     }
   }
-  
+
   async function runDailyAutopilot() {
     if (!userId) return;
-  
+
     setRunningAutopilot(true);
     setMsg(null);
     setDailyAutopilot(null);
-  
+    setAutopilot(null);
+
     try {
       const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-  
+
       const body = {
         user_id: userId,
         energy,
@@ -457,17 +442,18 @@ useEffect(() => {
         blockers: blockers.trim() ? blockers.trim() : null,
         schedule_calendar: scheduleCalendar,
         start_in_minutes: startInMinutes,
-        // optional: you can pass goal_ids: goals.map(g => g.id)
+        // Optional (recommended): send all goal ids so backend can't miss any
+        goal_ids: goals.map((g) => g.id),
       };
-  
+
       const res = await fetch(`${base}/api/run_daily_autopilot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-  
+
       if (!res.ok) throw new Error(await res.text());
-  
+
       const data = (await res.json()) as DailyAutopilotResult;
       setDailyAutopilot(data);
       setToast("✅ Daily plan created");
@@ -477,16 +463,20 @@ useEffect(() => {
       setRunningAutopilot(false);
     }
   }
-  
+
+  // ✅ helper: map goal id -> title for nicer daily UI
+  const goalTitleById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const g of goals) m.set(g.id, g.title);
+    return m;
+  }, [goals]);
 
   return (
     <main className="p-8 max-w-3xl">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">commitAI</h1>
-          <p className="mt-1 text-sm text-gray-600">
-            Signed in as {email ?? "…"}
-          </p>
+          <p className="mt-1 text-sm text-gray-600">Signed in as {email ?? "…"}</p>
         </div>
 
         <button className="underline text-sm" onClick={signOut}>
@@ -518,11 +508,7 @@ useEffect(() => {
               />
             </label>
 
-            <button
-              className="border rounded px-3 py-2 text-sm"
-              disabled={savingGoal}
-              type="submit"
-            >
+            <button className="border rounded px-3 py-2 text-sm" disabled={savingGoal} type="submit">
               {savingGoal ? "Creating..." : "Create goal"}
             </button>
           </div>
@@ -540,17 +526,13 @@ useEffect(() => {
         {loadingGoals ? (
           <p className="mt-3 text-sm text-gray-600">Loading...</p>
         ) : goals.length === 0 ? (
-          <p className="mt-3 text-sm text-gray-600">
-            No goals yet. Create your first goal above.
-          </p>
+          <p className="mt-3 text-sm text-gray-600">No goals yet. Create your first goal above.</p>
         ) : (
           <ul className="mt-3 space-y-2">
             {goals.map((g) => (
               <li key={g.id} className="border rounded p-3">
                 <div className="font-medium">{g.title}</div>
-                <div className="text-sm text-gray-600">
-                  Cadence/day: {g.cadence_per_day}
-                </div>
+                <div className="text-sm text-gray-600">Cadence/day: {g.cadence_per_day}</div>
               </li>
             ))}
           </ul>
@@ -561,9 +543,7 @@ useEffect(() => {
         <h2 className="font-semibold">Today’s check-in</h2>
 
         {!selectedGoal ? (
-          <p className="mt-2 text-sm text-gray-600">
-            Create a goal first to start checking in.
-          </p>
+          <p className="mt-2 text-sm text-gray-600">Create a goal first to start checking in.</p>
         ) : loadingCheckins ? (
           <p className="mt-2 text-sm text-gray-600">Loading check-ins…</p>
         ) : (
@@ -608,285 +588,269 @@ useEffect(() => {
               </label>
 
               <label className="text-sm flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={completed}
-                  onChange={(e) => setCompleted(e.target.checked)}
-                />
+                <input type="checkbox" checked={completed} onChange={(e) => setCompleted(e.target.checked)} />
                 Mark goal completed today
               </label>
             </div>
 
-            {/* <label className="text-sm flex items-center gap-2 md:col-span-2">
+            {/* ✅ Calendar toggle (single source of truth) */}
+            <label className="text-sm flex items-center gap-2 mt-3">
               <input
                 type="checkbox"
                 checked={scheduleCalendar}
                 onChange={(e) => setScheduleCalendar(e.target.checked)}
               />
-              Schedule these steps on my Google Calendar
+              Add plan to Google Calendar
             </label>
 
-            <label className="text-sm md:col-span-2">
-              Start in (minutes)
-              <input
-                className="mt-1 w-full border rounded px-3 py-2"
-                type="number"
-                min={0}
-                max={180}
-                value={startInMinutes}
-                onChange={(e) => setStartInMinutes(Number(e.target.value))}
-                disabled={!scheduleCalendar}
-              />
-            </label> */}
+            {scheduleCalendar && (
+              <label className="text-sm mt-2 block">
+                Start in (minutes)
+                <input
+                  className="mt-1 w-32 border rounded px-3 py-2"
+                  type="number"
+                  min={0}
+                  max={180}
+                  value={startInMinutes}
+                  onChange={(e) => setStartInMinutes(Number(e.target.value))}
+                />
+              </label>
+            )}
 
-            <label className="text-sm flex items-center gap-2 mt-3">
-  <input
-    type="checkbox"
-    checked={scheduleCalendar}
-    onChange={(e) => setScheduleCalendar(e.target.checked)}
-  />
-  Add plan to Google Calendar
-</label>
-
-{scheduleCalendar && (
-  <label className="text-sm mt-2 block">
-    Start in (minutes)
-    <input
-      className="mt-1 w-32 border rounded px-3 py-2"
-      type="number"
-      min={0}
-      max={180}
-      value={startInMinutes}
-      onChange={(e) => setStartInMinutes(Number(e.target.value))}
-    />
-  </label>
-)}
-
-            <button
-              className="mt-4 border rounded px-3 py-2 text-sm"
-              onClick={saveTodayCheckin}
-              disabled={savingCheckin}
-            >
+            <button className="mt-4 border rounded px-3 py-2 text-sm" onClick={saveTodayCheckin} disabled={savingCheckin}>
               {savingCheckin ? "Saving…" : "Save today’s check-in"}
             </button>
 
+            <button className="mt-3 border rounded px-3 py-2 text-sm" onClick={runAutopilot} disabled={runningAutopilot}>
+              {runningAutopilot ? "Running Autopilot…" : "Run Autopilot (Selected Goal)"}
+            </button>
+
             <button
-  className="mt-3 border rounded px-3 py-2 text-sm"
-  onClick={runAutopilot}
-  disabled={runningAutopilot}
->
-  {runningAutopilot ? "Running Autopilot…" : "Run Autopilot"}
-</button>
+              className="mt-3 border rounded px-3 py-2 text-sm"
+              onClick={runDailyAutopilot}
+              disabled={runningAutopilot}
+            >
+              {runningAutopilot ? "Running Daily Autopilot…" : "Run Daily Autopilot (All Goals)"}
+            </button>
 
-<button
-  className="mt-3 border rounded px-3 py-2 text-sm"
-  onClick={runDailyAutopilot}
-  disabled={runningAutopilot}
->
-  {runningAutopilot ? "Running Daily Autopilot…" : "Run Daily Autopilot (All Goals)"}
-</button>
+            {/* ✅ Single-goal autopilot card */}
+            {autopilot && (
+              <div className="mt-4 border rounded p-4">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">Autopilot Plan</div>
+                  <div className="text-sm text-gray-600">{autopilot.total_minutes} min</div>
+                </div>
 
+                <p className="mt-1 text-sm text-gray-700">
+                  <span className="font-medium">{autopilot.selected_agent}</span> · {autopilot.state}
+                </p>
 
-{autopilot && (
-  <div className="mt-4 border rounded p-4">
-    <div className="flex items-center justify-between">
-      <div className="font-semibold">Autopilot Plan</div>
-      <div className="text-sm text-gray-600">{autopilot.total_minutes} min</div>
-    </div>
+                <p className="mt-2 text-sm text-gray-600">{autopilot.summary}</p>
 
-    <p className="mt-1 text-sm text-gray-700">
-      <span className="font-medium">{autopilot.selected_agent}</span> ·{" "}
-      {autopilot.state}
-    </p>
+                <ol className="mt-3 space-y-2 list-decimal list-inside">
+                  {autopilot.steps.map((s, idx) => (
+                    <li key={idx} className="border rounded p-3">
+                      <div className="font-medium">
+                        {s.title} <span className="text-sm text-gray-600">({s.minutes}m)</span>
+                      </div>
+                      <div className="text-sm mt-1">{s.details}</div>
+                    </li>
+                  ))}
+                </ol>
 
-    <p className="mt-2 text-sm text-gray-600">{autopilot.summary}</p>
+                {autopilot.calendar_error && (
+                  <p className="mt-3 text-sm text-red-600">Calendar error: {autopilot.calendar_error}</p>
+                )}
 
-    <ol className="mt-3 space-y-2 list-decimal list-inside">
-      {autopilot.steps.map((s, idx) => (
-        <li key={idx} className="border rounded p-3">
-          <div className="font-medium">
-            {s.title}{" "}
-            <span className="text-sm text-gray-600">({s.minutes}m)</span>
-          </div>
-          <div className="text-sm mt-1">{s.details}</div>
-        </li>
-      ))}
-    </ol>
+                {(autopilot.calendar_events?.length ?? 0) > 0 && (
+                  <div className="mt-3 text-sm">
+                    <div className="font-medium">Calendar events created:</div>
+                    <ul className="list-disc list-inside">
+                      {autopilot.calendar_events!.map((e, i) => (
+                        <li key={i}>
+                          {e.step_title} —{" "}
+                          {e.htmlLink ? (
+                            <a className="underline" href={e.htmlLink} target="_blank" rel="noreferrer">
+                              open
+                            </a>
+                          ) : (
+                            e.event_id ?? "created"
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
 
-    {/* ✅ ADD THIS RIGHT HERE */}
-    {autopilot.calendar_error && (
-  <p className="mt-3 text-sm text-red-600">
-    Calendar error: {autopilot.calendar_error}
-  </p>
-)}
+                <p className="mt-3 text-xs text-gray-600">agent_run_id: {autopilot.agent_run_id}</p>
+                {autopilot.opik_trace_id && (
+                  <p className="mt-1 text-xs text-gray-600">opik_trace_id: {autopilot.opik_trace_id}</p>
+                )}
 
-{dailyAutopilot && (
-  <div className="mt-4 border rounded p-4">
-    <div className="font-semibold">Daily Autopilot Schedule</div>
-    <p className="mt-2 text-sm text-gray-600">{dailyAutopilot.summary}</p>
+                <div className="mt-3 flex gap-2 relative z-10">
+                  <button
+                    type="button"
+                    className="border rounded px-3 py-2 text-sm cursor-pointer pointer-events-auto"
+                    onClick={async () => {
+                      try {
+                        const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+                        const res = await fetch(`${base}/api/feedback`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            user_id: userId!,
+                            agent_run_id: autopilot.agent_run_id,
+                            opik_trace_id: autopilot.opik_trace_id ?? null,
+                            helpful: true,
+                            comment: null,
+                          }),
+                        });
 
-    {dailyAutopilot.calendar_error && (
-      <p className="mt-3 text-sm text-red-600">
-        Calendar error: {dailyAutopilot.calendar_error}
-      </p>
-    )}
+                        if (!res.ok) {
+                          const t = await res.text();
+                          throw new Error(`Feedback failed (${res.status}): ${t}`);
+                        }
 
-    <ol className="mt-3 space-y-2">
-      {dailyAutopilot.schedule.map((b, i) => (
-        <li key={i} className="border rounded p-3">
-          <div className="font-medium">
-            {b.title}{" "}
-            <span className="text-xs text-gray-600">
-              ({new Date(b.start).toLocaleTimeString()} - {new Date(b.end).toLocaleTimeString()})
-            </span>
-          </div>
-          <div className="text-sm mt-1">{b.details}</div>
-          <div className="text-xs text-gray-600 mt-1">
-            kind: {b.kind} · goals: {b.goal_ids.length}
-          </div>
-        </li>
-      ))}
-    </ol>
-  </div>
-)}
+                        setToast("✅ Feedback saved (helpful).");
+                        await loadRecentRuns();
+                      } catch (e: any) {
+                        setMsg(e?.message ?? String(e));
+                      }
+                    }}
+                  >
+                    👍 Helpful
+                  </button>
 
+                  <button
+                    type="button"
+                    className="border rounded px-3 py-2 text-sm cursor-pointer pointer-events-auto"
+                    onClick={async () => {
+                      try {
+                        const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+                        const res = await fetch(`${base}/api/feedback`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            user_id: userId!,
+                            agent_run_id: autopilot.agent_run_id,
+                            opik_trace_id: autopilot.opik_trace_id ?? null,
+                            helpful: false,
+                            comment: null,
+                          }),
+                        });
 
-{autopilot.calendar_events && autopilot.calendar_events.length > 0 && (
-  <div className="mt-3 text-sm">
-    <div className="font-medium">Calendar events created:</div>
-    <ul className="list-disc list-inside">
-      {autopilot.calendar_events.map((e, i) => (
-        <li key={i}>
-          {e.step_title} —{" "}
-          {e.htmlLink ? (
-            <a className="underline" href={e.htmlLink} target="_blank" rel="noreferrer">
-              open
-            </a>
-          ) : (
-            e.event_id ?? "created"
-          )}
-        </li>
-      ))}
-    </ul>
-  </div>
-)}
+                        if (!res.ok) {
+                          const t = await res.text();
+                          throw new Error(`Feedback failed (${res.status}): ${t}`);
+                        }
 
+                        setToast("✅ Feedback saved (not helpful).");
+                        await loadRecentRuns();
+                      } catch (e: any) {
+                        setMsg(e?.message ?? String(e));
+                      }
+                    }}
+                  >
+                    👎 Not helpful
+                  </button>
+                </div>
+              </div>
+            )}
 
-    {(autopilot as any)?.calendar_events?.length > 0 && (
-      <div className="mt-3 text-sm">
-        <div className="font-medium">Calendar events created:</div>
-        <ul className="list-disc list-inside">
-          {(autopilot as any).calendar_events.map((e: any, i: number) => (
-            <li key={i}>
-              {e.step_title} —{" "}
-              {e.htmlLink ? (
-                <a className="underline" href={e.htmlLink} target="_blank" rel="noreferrer">
-                  open
-                </a>
-              ) : (
-                e.event_id
-              )}
-            </li>
-          ))}
-        </ul>
-      </div>
-    )}
-    {/* ✅ END ADD */}
+            {/* ✅ Daily autopilot card (All goals) */}
+            {dailyAutopilot && (
+              <div className="mt-4 border rounded p-4">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">Daily Autopilot</div>
+                  <div className="text-sm text-gray-600">{dailyAutopilot.daily_run_id ?? ""}</div>
+                </div>
 
+                <p className="mt-2 text-sm text-gray-600">{dailyAutopilot.summary}</p>
 
-{autopilot.calendar_error && (
-  <div className="mt-3 text-sm text-red-600">
-    Calendar error: {autopilot.calendar_error}
-  </div>
-)}
+                {dailyAutopilot.calendar_error && (
+                  <p className="mt-3 text-sm text-red-600">Calendar error: {dailyAutopilot.calendar_error}</p>
+                )}
 
+                {(dailyAutopilot.items?.length ?? 0) > 0 && (
+                  <>
+                    <div className="mt-3 font-medium text-sm">Today’s routine</div>
+                    <ul className="mt-2 space-y-2">
+                      {dailyAutopilot.items.map((it, idx) => (
+                        <li key={idx} className="border rounded p-3">
+                          <div className="flex items-center justify-between">
+                            <div className="font-medium">{it.title}</div>
+                            <div className="text-xs text-gray-600">
+                              {it.window ? it.window : ""}
+                              {it.minutes ? ` · ${it.minutes}m` : ""}
+                            </div>
+                          </div>
 
-    <p className="mt-3 text-xs text-gray-600">
-      agent_run_id: {autopilot.agent_run_id}
-    </p>
+                          {(it.goal_ids?.length ?? 0) > 0 && (
+                            <div className="text-xs text-gray-600 mt-1">
+                              Goals:{" "}
+                              {it.goal_ids!.map((gid) => goalTitleById.get(gid) ?? gid).join(", ")}
+                            </div>
+                          )}
 
-    {autopilot.opik_trace_id && (
-      <p className="mt-1 text-xs text-gray-600">
-        opik_trace_id: {autopilot.opik_trace_id}
-      </p>
-    )}
+                          {it.details && <div className="text-sm mt-1">{it.details}</div>}
+                          {it.kind && (
+                            <div className="text-xs text-gray-500 mt-1">
+                              kind: {it.kind}
+                              {it.occurrences ? ` · occurrences: ${it.occurrences}` : ""}
+                              {it.min_gap_minutes ? ` · min gap: ${it.min_gap_minutes}m` : ""}
+                            </div>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
 
-    {/* ✅ Add feedback buttons here */}
-    <div className="mt-3 flex gap-2 relative z-10">
-  <button
-    type="button"
-    className="border rounded px-3 py-2 text-sm cursor-pointer pointer-events-auto"
-    onClick={async () => {
-      setMsg("clicked 👍");
-      try {
-        const base =
-          process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-        const res = await fetch(`${base}/api/feedback`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            user_id: userId!,
-            agent_run_id: autopilot.agent_run_id,
-            opik_trace_id: autopilot.opik_trace_id ?? null,
-            helpful: true,
-            comment: null,
-          }),
-        });
-    
-        if (!res.ok) {
-          const t = await res.text();
-          throw new Error(`Feedback failed (${res.status}): ${t}`);
-        }
-    
-        setToast("✅ Feedback saved (helpful).");
-      } catch (e: any) {
-        setMsg(e?.message ?? String(e));
-      }
-    }}
-    
-  >
-    👍 Helpful
-  </button>
+                {(dailyAutopilot.schedule?.length ?? 0) > 0 && (
+                  <>
+                    <div className="mt-4 font-medium text-sm">Suggested schedule</div>
+                    <ol className="mt-2 space-y-2">
+                      {dailyAutopilot.schedule.map((b, i) => (
+                        <li key={i} className="border rounded p-3">
+                          <div className="font-medium">
+                            {b.title}{" "}
+                            <span className="text-xs text-gray-600">
+                              (
+                              {new Date(b.start).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} -{" "}
+                              {new Date(b.end).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})
+                            </span>
+                          </div>
+                          <div className="text-sm mt-1">{b.details}</div>
+                          <div className="text-xs text-gray-600 mt-1">
+                            kind: {b.kind} · goals: {(b.goal_ids?.length ?? 0).toString()}
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  </>
+                )}
 
-  <button
-    type="button"
-    className="border rounded px-3 py-2 text-sm cursor-pointer pointer-events-auto"
-    onClick={async () => {
-      const base =
-        process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-      await fetch(`${base}/api/feedback`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_id: userId!,
-          agent_run_id: autopilot.agent_run_id,
-          opik_trace_id: autopilot.opik_trace_id ?? null,
-          helpful: false,
-          comment: null,
-        }),
-      });
-      setMsg("✅ Feedback saved (not helpful).");
-    }}
-  >
-    👎 Not helpful
-  </button>
-</div>
-
-  </div>
-)}
-
-{/* <section className="mt-8 border rounded p-4">
-  <h2 className="font-semibold">Calendar integration</h2>
-
-  {!userId ? (
-    <p className="mt-2 text-sm text-gray-600">Loading user…</p>
-  ) : (
-    <div className="mt-3">
-      <CalendarIntegration userId={userId} />
-    </div>
-  )}
-</section> */}
-
+                {(dailyAutopilot.calendar_events?.length ?? 0) > 0 && (
+                  <div className="mt-3 text-sm">
+                    <div className="font-medium">Calendar events created:</div>
+                    <ul className="list-disc list-inside">
+                      {dailyAutopilot.calendar_events!.map((e, i) => (
+                        <li key={i}>
+                          {e.step_title} —{" "}
+                          {e.htmlLink ? (
+                            <a className="underline" href={e.htmlLink} target="_blank" rel="noreferrer">
+                              open
+                            </a>
+                          ) : (
+                            e.event_id ?? "created"
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
 
             <p className="mt-2 text-xs text-gray-600">
               Status:{" "}
@@ -905,16 +869,12 @@ useEffect(() => {
                     <li key={c.id} className="border rounded p-3">
                       <div className="flex items-center justify-between">
                         <div className="font-medium">{c.checkin_date}</div>
-                        <div className="text-sm">
-                          {c.completed ? "✅ Completed" : "⬜ Not completed"}
-                        </div>
+                        <div className="text-sm">{c.completed ? "✅ Completed" : "⬜ Not completed"}</div>
                       </div>
                       <div className="text-sm text-gray-600 mt-1">
                         Energy: {c.energy} · Workload: {c.workload}
                       </div>
-                      {c.blockers && (
-                        <div className="text-sm mt-1">Blockers: {c.blockers}</div>
-                      )}
+                      {c.blockers && <div className="text-sm mt-1">Blockers: {c.blockers}</div>}
                     </li>
                   ))}
                 </ul>
@@ -926,61 +886,56 @@ useEffect(() => {
 
       <section className="mt-8 border rounded p-4">
         <h2 className="font-semibold">Calendar integration</h2>
-
-          {!userId ? (
-           <p className="mt-2 text-sm text-gray-600">Loading user…</p>
-         ) : (
-             <div className="mt-3">
-               <CalendarIntegration userId={userId} />
-             </div>
-          )}
+        {!userId ? (
+          <p className="mt-2 text-sm text-gray-600">Loading user…</p>
+        ) : (
+          <div className="mt-3">
+            <CalendarIntegration userId={userId} />
+          </div>
+        )}
       </section>
 
       <section className="mt-8 border rounded p-4">
-  <div className="flex items-center justify-between">
-    <h2 className="font-semibold">Recent agent runs</h2>
-    <button className="underline text-sm" onClick={loadRecentRuns}>
-      Refresh
-    </button>
-  </div>
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold">Recent agent runs</h2>
+          <button className="underline text-sm" onClick={loadRecentRuns}>
+            Refresh
+          </button>
+        </div>
 
-  {loadingRuns ? (
-    <p className="mt-2 text-sm text-gray-600">Loading…</p>
-  ) : recentRuns.length === 0 ? (
-    <p className="mt-2 text-sm text-gray-600">No runs yet. Click “Run Autopilot”.</p>
-  ) : (
-    <ul className="mt-3 space-y-2">
-      {recentRuns.map((r) => (
-        <li key={r.id} className="border rounded p-3">
-          <div className="flex items-center justify-between">
-            <div className="font-medium">{r.selected_agent} · {r.state}</div>
-            <div className="text-xs text-gray-600">
-              {new Date(r.created_at).toLocaleString()}
-            </div>
-          </div>
+        {loadingRuns ? (
+          <p className="mt-2 text-sm text-gray-600">Loading…</p>
+        ) : recentRuns.length === 0 ? (
+          <p className="mt-2 text-sm text-gray-600">No runs yet. Click “Run Autopilot”.</p>
+        ) : (
+          <ul className="mt-3 space-y-2">
+            {recentRuns.map((r) => (
+              <li key={r.id} className="border rounded p-3">
+                <div className="flex items-center justify-between">
+                  <div className="font-medium">
+                    {r.selected_agent} · {r.state}
+                  </div>
+                  <div className="text-xs text-gray-600">{new Date(r.created_at).toLocaleString()}</div>
+                </div>
 
-          <div className="text-sm text-gray-700 mt-1">{r.summary}</div>
+                <div className="text-sm text-gray-700 mt-1">{r.summary}</div>
 
-          <div className="text-xs text-gray-600 mt-2 flex gap-3">
-            <span>run_id: {r.id}</span>
-            {r.opik_trace_id && <span>opik: {r.opik_trace_id}</span>}
-            {r.feedback && <span>feedback: {r.feedback.helpful ? "👍" : "👎"}</span>}
-          </div>
-        </li>
-      ))}
-    </ul>
-  )}
-</section>
-
+                <div className="text-xs text-gray-600 mt-2 flex gap-3">
+                  <span>run_id: {r.id}</span>
+                  {r.opik_trace_id && <span>opik: {r.opik_trace_id}</span>}
+                  {r.feedback && <span>feedback: {r.feedback.helpful ? "👍" : "👎"}</span>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {toast && (
-  <div className="fixed bottom-4 right-4 z-50 border rounded px-4 py-2 text-sm bg-white shadow">
-    {toast}
-  </div>
-)}
-
+        <div className="fixed bottom-4 right-4 z-50 border rounded px-4 py-2 text-sm bg-white shadow">
+          {toast}
+        </div>
+      )}
     </main>
   );
 }
-
-
