@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import uuid
 from typing import Optional, List, Dict, Any, Union
 
 from dotenv import load_dotenv
@@ -132,6 +133,7 @@ class DailyAutopilotRequest(BaseModel):
     goal_ids: Optional[List[str]] = None
 
 class DailyPlanItem(BaseModel):
+    item_id: Optional[str] = None  # ✅ for checklist + event mapping
     title: str
     minutes: int = Field(ge=1, le=180)
     details: str
@@ -144,11 +146,8 @@ class DailyPlanItem(BaseModel):
     occurrences: int = Field(default=1, ge=1, le=12)
     min_gap_minutes: int = Field(default=60, ge=0, le=600)
 
-class DailyPlanOutput(BaseModel):
-    summary: str
-    items: List[DailyPlanItem] = Field(min_length=2, max_length=20)
-
 class ScheduledBlock(BaseModel):
+    item_id: Optional[str] = None  # ✅ carries through to calendar
     title: str
     details: str
     goal_ids: List[str]
@@ -156,6 +155,10 @@ class ScheduledBlock(BaseModel):
     end: str
     kind: str
 
+
+class DailyPlanOutput(BaseModel):
+    summary: str
+    items: List[DailyPlanItem] = Field(min_length=2, max_length=20)
 
 # -------------------------
 # Models (Daily Autopilot)
@@ -454,6 +457,80 @@ def schedule_calendar_from_steps(
 
     return calendar_events, calendar_error
 
+def _ensure_item_ids(plan: dict) -> dict:
+    """Ensure each daily item has a stable id for checklist + calendar mapping."""
+    items = plan.get("items") or []
+    for it in items:
+        if not it.get("item_id"):
+            it["item_id"] = str(uuid.uuid4())
+    plan["items"] = items
+    return plan
+
+def _build_daily_memory(sb: Client, user_id: str, goals: List[dict]) -> str:
+    """Combine memory across goals (MVP)."""
+    chunks = []
+    for g in goals[:6]:
+        try:
+            chunks.append(build_memory(sb, user_id, g["id"]))
+        except Exception:
+            continue
+    joined = "\n\n---\n\n".join(chunks)
+    return joined[:2500]
+
+def _inject_habit_items_if_missing(plan: dict, goals: List[dict]) -> dict:
+    """
+    Guardrail: if a goal title looks like a habit (e.g., water) and the plan didn't create recurring habit,
+    inject a habit item so it ALWAYS appears in the plan UI.
+    """
+    items = plan.get("items") or []
+    covered = set()
+    for it in items:
+        for gid in (it.get("goal_ids") or []):
+            covered.add(gid)
+
+    for g in goals:
+        gid = g.get("id")
+        title = (g.get("title") or "").lower()
+        cadence = int(g.get("cadence_per_day") or 1)
+
+        if not gid or gid in covered:
+            continue
+
+        # Heuristic: water/hydration or high-cadence goals become habits
+        is_water = any(k in title for k in ["water", "hydrate", "hydration"])
+        is_habit = is_water or cadence >= 3
+
+        if is_habit:
+            occ = min(max(cadence, 3), 8)  # cap for noise control
+            items.append({
+                "item_id": str(uuid.uuid4()),
+                "title": f"{g.get('title')} (check-in)",
+                "minutes": 2,
+                "details": "Quick 10-second action. Log it immediately so the plan stays accurate.",
+                "goal_ids": [gid],
+                "kind": "habit",
+                "window": "any",
+                "occurrences": occ,
+                "min_gap_minutes": max(60, 600 // occ),
+            })
+        else:
+            # fallback: at least one focus item
+            items.append({
+                "item_id": str(uuid.uuid4()),
+                "title": f"Progress on: {g.get('title')}",
+                "minutes": 25,
+                "details": "Do the smallest meaningful next step.",
+                "goal_ids": [gid],
+                "kind": "focus",
+                "window": "any",
+                "occurrences": 1,
+                "min_gap_minutes": 60,
+            })
+
+    plan["items"] = items
+    return plan
+
+
 
 # -------------------------
 # Preference + policy + memory
@@ -723,6 +800,7 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
 
         # if it spills beyond window, just keep it (MVP) or clamp later
         scheduled.append({
+            "item_id": it.get("item_id"),
             "title": it.get("title"),
             "details": it.get("details", ""),
             "goal_ids": it.get("goal_ids", []),
@@ -765,13 +843,15 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
                 tries += 1
 
             scheduled.append({
+                "item_id": it.get("item_id"),  # ✅ NEW LINE
                 "title": it.get("title"),
                 "details": it.get("details", ""),
                 "goal_ids": it.get("goal_ids", []),
-                "kind": it.get("kind", "habit"),
+                "kind": "habit",
                 "start": t.isoformat(),
                 "end": (t + timedelta(minutes=dur)).isoformat(),
             })
+
             t = t + timedelta(minutes=step)
 
     # sort by time
@@ -1015,6 +1095,80 @@ Recent memory:
         raise ValueError(f"daily_planner: missing goal coverage for goal_ids={missing}")
 
     return plan
+
+@track(project_name=OPIK_PROJECT, name="daily_reviser_llm", flush=True)
+def daily_reviser_llm(*, req_payload: dict, goals: List[dict], memory: str, prev_plan: dict, feedback: str) -> dict:
+    prompt = f"""
+You are CommitAI Daily Plan Reviser.
+
+You will revise the EXISTING plan based on user feedback.
+You must still cover ALL goals.
+
+Return ONLY valid JSON:
+{{
+  "summary": "...",
+  "items": [
+    {{
+      "item_id": "string or null",
+      "title": "...",
+      "minutes": 25,
+      "details": "...",
+      "goal_ids": ["..."],
+      "kind": "focus" | "habit",
+      "window": "morning" | "midday" | "afternoon" | "evening" | "any",
+      "occurrences": 1,
+      "min_gap_minutes": 120
+    }}
+  ]
+}}
+
+Hard rules:
+- Every goal must appear in at least ONE item (goal_ids must include that goal's id).
+- If feedback says "too much", shorten total load (reduce minutes/blocks).
+- If feedback says "move X earlier/later", change windows accordingly.
+- Habits (like water) should be kind="habit" with occurrences>1 and min_gap_minutes>=90.
+- Keep items <= 20. Avoid fluff. JSON only.
+
+User state:
+energy={req_payload.get("energy")}
+workload={req_payload.get("workload")}
+blockers={req_payload.get("blockers")}
+
+Goals:
+{json.dumps(goals)}
+
+Previous plan:
+{json.dumps(prev_plan)[:2500]}
+
+User feedback:
+{feedback}
+
+Recent memory:
+{memory[:1500]}
+"""
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.25,
+    )
+    text = resp.choices[0].message.content or "{}"
+    plan = _validate_daily_plan_json(text)
+    plan = _ensure_item_ids(plan)
+    plan = _inject_habit_items_if_missing(plan, goals)
+
+    # coverage guardrail
+    goal_ids = {g["id"] for g in goals if g.get("id")}
+    covered = set()
+    for it in plan.get("items", []):
+        for gid in it.get("goal_ids", []):
+            covered.add(gid)
+    missing = [gid for gid in goal_ids if gid not in covered]
+    if missing:
+        raise ValueError(f"daily_reviser: missing goal coverage for goal_ids={missing}")
+
+    return plan
+
 
 
 @track(project_name=OPIK_PROJECT, name="critic_rule", flush=True)
@@ -1482,13 +1636,13 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
         if not goals:
             raise HTTPException(status_code=400, detail="No goals found for user")
 
-        # lightweight memory: reuse your existing memory but we just pick first goal_id (MVP)
-        # better later: build memory across all goals
-        memory = build_memory(sb, req.user_id, goals[0]["id"])
-
         req_payload = _dump_model(req)
+        memory = _build_daily_memory(sb, req.user_id, goals)
 
         plan = daily_planner_llm(req_payload=req_payload, goals=goals, memory=memory)
+        plan = _ensure_item_ids(plan)
+        plan = _inject_habit_items_if_missing(plan, goals)
+
         schedule = schedule_daily_items(
             plan["items"],
             now_local=now_local,
@@ -1496,50 +1650,280 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
             buffer_minutes=5,
         )
 
-        # persist daily run
+        # persist draft
+        plan_with_meta = {
+            **plan,
+            "_meta": {
+                "status": "DRAFT",
+                "version": 1,
+                "tz": tz_name,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+
         dr = sb.table("daily_runs").insert({
             "user_id": req.user_id,
             "run_date": now_local.date().isoformat(),
             "state": "DAILY",
             "selected_agent": "daily",
             "summary": plan["summary"],
-            "plan_json": plan,
+            "plan_json": plan_with_meta,
             "schedule_json": schedule,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute().data
+
         daily_run_id = (dr or [{}])[0].get("id")
 
-        # optional calendar scheduling from SCHEDULE (not items)
-        calendar_events = []
-        calendar_error = None
-        if req.schedule_calendar:
-            try:
-                for blk in schedule:
-                    start_dt = datetime.fromisoformat(blk["start"])
-                    end_dt = datetime.fromisoformat(blk["end"])
-                    evt = google_create_event(
-                        user_id=req.user_id,
-                        title=f"commitAI: {blk['title']}",
-                        details=blk.get("details", ""),
-                        start=start_dt,
-                        end=end_dt,
-                        time_zone=tz_name,
-                    )
-                    calendar_events.append({
-                        "step_title": blk["title"],
-                        "event_id": evt.get("id"),
-                        "htmlLink": evt.get("htmlLink"),
-                        "start": blk["start"],
-                        "end": blk["end"],
-                    })
-            except Exception as e:
-                calendar_error = str(e)
-
+        # ✅ IMPORTANT: do NOT touch calendar here anymore
         return {
             "daily_run_id": daily_run_id,
+            "status": "DRAFT",
+            "version": 1,
             "summary": plan["summary"],
             "items": plan["items"],
+            "schedule": schedule,         # preview timeline in UI
+            "calendar_events": [],
+            "calendar_error": None,
+        }
+
+    except (ValidationError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+class DailyReviseRequest(BaseModel):
+    user_id: str
+    daily_run_id: str
+    feedback: str
+    energy: int = Field(ge=1, le=5)
+    workload: int = Field(ge=1, le=5)
+    blockers: Optional[str] = None
+    start_in_minutes: int = Field(default=5, ge=0, le=180)
+    goal_ids: Optional[List[str]] = None
+
+@app.post("/api/daily/revise")
+def daily_revise(req: DailyReviseRequest):
+    try:
+        row = (
+            sb.table("daily_runs")
+            .select("id,user_id,run_date,plan_json")
+            .eq("id", req.daily_run_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="daily_run not found")
+        row = row[0]
+        if row.get("user_id") != req.user_id:
+            raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
+
+        prev_plan = row.get("plan_json") or {}
+        prev_meta = (prev_plan.get("_meta") or {})
+        prev_version = int(prev_meta.get("version") or 1)
+
+        # timezone
+        if ZoneInfo:
+            now_local = datetime.now(ZoneInfo("America/Detroit"))
+            tz_name = "America/Detroit"
+        else:
+            now_local = datetime.now(timezone.utc)
+            tz_name = "UTC"
+
+        # goals (all or subset)
+        q = sb.table("goals").select("id,title,cadence_per_day").eq("user_id", req.user_id)
+        if req.goal_ids:
+            q = q.in_("id", req.goal_ids)
+        goals = q.execute().data or []
+        if not goals:
+            raise HTTPException(status_code=400, detail="No goals found for user")
+
+        req_payload = _dump_model(req)
+        memory = _build_daily_memory(sb, req.user_id, goals)
+
+        new_plan = daily_reviser_llm(
+            req_payload=req_payload,
+            goals=goals,
+            memory=memory,
+            prev_plan=prev_plan,
+            feedback=req.feedback.strip(),
+        )
+
+        schedule = schedule_daily_items(
+            new_plan["items"],
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
+        )
+
+        plan_with_meta = {
+            **new_plan,
+            "_meta": {
+                "status": "DRAFT",
+                "version": prev_version + 1,
+                "parent_daily_run_id": req.daily_run_id,
+                "tz": tz_name,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "feedback": req.feedback.strip()[:500],
+            }
+        }
+
+        dr = sb.table("daily_runs").insert({
+            "user_id": req.user_id,
+            "run_date": row.get("run_date"),
+            "state": "DAILY",
+            "selected_agent": "daily",
+            "summary": new_plan["summary"],
+            "plan_json": plan_with_meta,
+            "schedule_json": schedule,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute().data
+        new_id = (dr or [{}])[0].get("id")
+
+        return {
+            "daily_run_id": new_id,
+            "status": "DRAFT",
+            "version": prev_version + 1,
+            "summary": new_plan["summary"],
+            "items": new_plan["items"],
             "schedule": schedule,
+            "calendar_events": [],
+            "calendar_error": None,
+        }
+
+    except (ValidationError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DailyCommitRequest(BaseModel):
+    user_id: str
+    daily_run_id: str
+    start_in_minutes: int = Field(default=5, ge=0, le=180)
+
+@app.post("/api/daily/commit")
+def daily_commit(req: DailyCommitRequest):
+    try:
+        row = (
+            sb.table("daily_runs")
+            .select("id,user_id,run_date,plan_json")
+            .eq("id", req.daily_run_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="daily_run not found")
+        row = row[0]
+        if row.get("user_id") != req.user_id:
+            raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
+
+        plan = row.get("plan_json") or {}
+        items = plan.get("items") or []
+        if not items:
+            raise HTTPException(status_code=400, detail="daily_run has no plan items")
+
+        # timezone
+        if ZoneInfo:
+            now_local = datetime.now(ZoneInfo("America/Detroit"))
+            tz_name = "America/Detroit"
+        else:
+            now_local = datetime.now(timezone.utc)
+            tz_name = "UTC"
+
+        # recompute schedule at commit time (so times are fresh)
+        schedule = schedule_daily_items(
+            items,
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
+        )
+
+        calendar_events = []
+        calendar_error = None
+
+        try:
+            # create events for all blocks >= 2 min (habits like water will show too)
+            for blk in schedule:
+                start_dt = datetime.fromisoformat(blk["start"])
+                end_dt = datetime.fromisoformat(blk["end"])
+                evt = google_create_event(
+                    user_id=req.user_id,
+                    title=f"commitAI: {blk['title']}",
+                    details=blk.get("details", ""),
+                    start=start_dt,
+                    end=end_dt,
+                    time_zone=tz_name,
+                )
+                calendar_events.append({
+                    "item_id": blk.get("item_id"),
+                    "step_title": blk["title"],
+                    "event_id": evt.get("id"),
+                    "htmlLink": evt.get("htmlLink"),
+                    "start": blk["start"],
+                    "end": blk["end"],
+                })
+
+            # add a final “check-in” event at end of last block
+            if schedule:
+                last_end = datetime.fromisoformat(schedule[-1]["end"])
+                chk_evt = google_create_event(
+                    user_id=req.user_id,
+                    title="commitAI: quick check-in",
+                    details="Mark what you actually finished. If you're behind, commitAI will adjust the plan.",
+                    start=last_end,
+                    end=last_end + timedelta(minutes=5),
+                    time_zone=tz_name,
+                )
+                calendar_events.append({
+                    "item_id": None,
+                    "step_title": "quick check-in",
+                    "event_id": chk_evt.get("id"),
+                    "htmlLink": chk_evt.get("htmlLink"),
+                    "start": last_end.isoformat(),
+                    "end": (last_end + timedelta(minutes=5)).isoformat(),
+                })
+
+        except Exception as e:
+            calendar_error = str(e)
+
+        # mark committed by updating plan_json meta + store committed schedule with event ids
+        meta = plan.get("_meta") or {}
+        meta["status"] = "COMMITTED"
+        meta["committed_at"] = datetime.now(timezone.utc).isoformat()
+        plan["_meta"] = meta
+
+        # enrich schedule with event_id/htmlLink if we can match by item_id + title
+        ev_by_key = {}
+        for e in calendar_events:
+            ev_by_key[(e.get("item_id"), e.get("step_title"))] = e
+
+        enriched_schedule = []
+        for blk in schedule:
+            key = (blk.get("item_id"), blk.get("title"))
+            e = ev_by_key.get(key)
+            enriched_schedule.append({
+                **blk,
+                "event_id": e.get("event_id") if e else None,
+                "htmlLink": e.get("htmlLink") if e else None,
+            })
+
+        sb.table("daily_runs").update({
+            "plan_json": plan,
+            "schedule_json": enriched_schedule,
+        }).eq("id", req.daily_run_id).execute()
+
+        return {
+            "daily_run_id": req.daily_run_id,
+            "status": "COMMITTED",
+            "summary": plan.get("summary") or "",
+            "items": items,
+            "schedule": enriched_schedule,
             "calendar_events": calendar_events,
             "calendar_error": calendar_error,
         }
