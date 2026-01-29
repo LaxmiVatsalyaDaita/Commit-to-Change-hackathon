@@ -206,6 +206,7 @@ export default function AppHome() {
   const [completed, setCompleted] = useState(false);
 
   // calendar commit setting (used AFTER preview)
+  const [scheduleCalendar, setScheduleCalendar] = useState(false);
   const [startInMinutes, setStartInMinutes] = useState(5);
 
   const [msg, setMsg] = useState<string | null>(null);
@@ -454,47 +455,38 @@ export default function AppHome() {
     await loadRecentRuns();
   }
 
-  async function runAutopilot() {
-    if (!selectedGoal?.id || !userId) return;
-
+  async function runAutopilotAllGoals() {
+    if (!userId) return;
+  
     setRunningAutopilot(true);
     setMsg(null);
-
-    // reset “review/commit” UI
-    setAutopilot(null);
     setDailyAutopilot(null);
-    setShowPlanFeedback(false);
-    setPlanFeedbackText("");
-
+    setAutopilot(null); // optional: clear single-goal state entirely
+  
     try {
+      const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+  
       const body = {
         user_id: userId,
-        goal_id: selectedGoal.id,
-        checkin_id: todayCheckin?.id ?? null,
         energy,
         workload,
         blockers: blockers.trim() ? blockers.trim() : null,
-        completed,
-        tz_name: tzName,
-        schedule_calendar: false,
+        schedule_calendar: scheduleCalendar,
         start_in_minutes: startInMinutes,
+        goal_ids: goals.map((g) => g.id), // ensures all goals included
       };
-
-      const res = await fetch(`${base}/api/run_autopilot`, {
+  
+      const res = await fetch(`${base}/api/run_daily_autopilot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(`Backend error (${res.status}): ${t}`);
-      }
-
-      const data = (await res.json()) as AutopilotResult;
-      setAutopilot(data);
-      setToast("✅ Plan generated (preview)");
-      await loadCheckins(selectedGoal.id);
+  
+      if (!res.ok) throw new Error(await res.text());
+  
+      const data = (await res.json()) as DailyAutopilotResult;
+      setDailyAutopilot(data);
+      setToast("✅ Autopilot plan created (all goals)");
       await loadRecentRuns();
     } catch (e: any) {
       setMsg(e?.message ?? String(e));
@@ -502,47 +494,7 @@ export default function AppHome() {
       setRunningAutopilot(false);
     }
   }
-
-  async function runDailyAutopilot() {
-    if (!userId) return;
-
-    setRunningAutopilot(true);
-    setMsg(null);
-
-    setDailyAutopilot(null);
-    setAutopilot(null);
-    setShowPlanFeedback(false);
-    setPlanFeedbackText("");
-
-    try {
-      const body = {
-        user_id: userId,
-        energy,
-        workload,
-        blockers: blockers.trim() ? blockers.trim() : null,
-        schedule_calendar: false,
-        start_in_minutes: startInMinutes,
-        goal_ids: goals.map((g) => g.id),
-        tz_name: tzName,
-      };
-
-      const res = await fetch(`${base}/api/run_daily_autopilot`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) throw new Error(await res.text());
-
-      const data = (await res.json()) as DailyAutopilotResult;
-      setDailyAutopilot(data);
-      setToast("✅ Daily plan generated (preview)");
-    } catch (e: any) {
-      setMsg(e?.message ?? String(e));
-    } finally {
-      setRunningAutopilot(false);
-    }
-  }
+  
 
   // ✅ Commit Autopilot plan to calendar AFTER user accepts it
   async function commitAutopilotToCalendar() {
@@ -779,13 +731,14 @@ export default function AppHome() {
                 {savingCheckin ? "Saving…" : "Save today’s check-in"}
               </button>
 
-              <button className="border rounded px-3 py-2 text-sm" onClick={runAutopilot} disabled={runningAutopilot}>
-                {runningAutopilot ? "Running…" : "Run Autopilot (Selected Goal)"}
-              </button>
+              <button
+                    className="mt-3 border rounded px-3 py-2 text-sm"
+                    onClick={runAutopilotAllGoals}
+                    disabled={runningAutopilot}
+                  >
+                    {runningAutopilot ? "Running Autopilot…" : "Run Autopilot (All Goals)"}
+                  </button>
 
-              <button className="border rounded px-3 py-2 text-sm" onClick={runDailyAutopilot} disabled={runningAutopilot}>
-                {runningAutopilot ? "Running…" : "Run Daily Autopilot (All Goals)"}
-              </button>
             </div>
 
             {/* ✅ Single-goal autopilot card: preview → accept → commit to calendar */}
@@ -877,7 +830,7 @@ export default function AppHome() {
                             setShowPlanFeedback(false);
                             setPlanFeedbackText("");
                             // ✅ re-run so “agents negotiate again”
-                            await runAutopilot();
+                            await runAutopilotAllGoals();
                           } catch (e: any) {
                             setMsg(e?.message ?? String(e));
                           }
@@ -930,11 +883,11 @@ export default function AppHome() {
               </div>
             )}
 
-            {/* ✅ Daily autopilot card: checklist + schedule preview → accept → commit to calendar */}
+            {/* Daily autopilot card: checklist + schedule preview → accept → commit to calendar */}
             {dailyAutopilot && (
               <div className="mt-4 border rounded p-4">
                 <div className="flex items-center justify-between">
-                  <div className="font-semibold">Daily Autopilot (Preview)</div>
+                  <div className="font-semibold">Autopilot Plan (for all your current goals)</div>
                   <div className="text-sm text-gray-600">{dailyChecklistStats.done}/{dailyChecklistStats.total} done</div>
                 </div>
 
