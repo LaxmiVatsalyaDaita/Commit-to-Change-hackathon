@@ -30,7 +30,7 @@ type CalendarEvent = {
   end?: string;
 };
 
-type PlanStep = { title: string; minutes: number; details: string };
+// type PlanStep = { title: string; minutes: number; details: string };
 
 type DailyPlanItem = {
   item_id: string;
@@ -54,17 +54,17 @@ type ScheduledBlock = {
   end: string;
 };
 
-type AutopilotResult = {
-  agent_run_id: string;
-  opik_trace_id?: string;
-  state: string;
-  selected_agent: string;
-  summary: string;
-  steps: PlanStep[];
-  total_minutes: number;
-  calendar_events?: CalendarEvent[];
-  calendar_error?: string | null;
-};
+// type AutopilotResult = {
+//   agent_run_id: string;
+//   opik_trace_id?: string;
+//   state: string;
+//   selected_agent: string;
+//   summary: string;
+//   steps: PlanStep[];
+//   total_minutes: number;
+//   calendar_events?: CalendarEvent[];
+//   calendar_error?: string | null;
+// };
 
 type DailyAutopilotResult = {
   daily_run_id?: string;
@@ -185,7 +185,6 @@ export default function AppHome() {
   const [savingCheckin, setSavingCheckin] = useState(false);
 
   // plans
-  const [autopilot, setAutopilot] = useState<AutopilotResult | null>(null);
   const [dailyAutopilot, setDailyAutopilot] = useState<DailyAutopilotResult | null>(null);
 
   // running states
@@ -461,7 +460,6 @@ export default function AppHome() {
     setRunningAutopilot(true);
     setMsg(null);
     setDailyAutopilot(null);
-    setAutopilot(null); // optional: clear single-goal state entirely
   
     try {
       const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -474,6 +472,7 @@ export default function AppHome() {
         schedule_calendar: scheduleCalendar,
         start_in_minutes: startInMinutes,
         goal_ids: goals.map((g) => g.id), // ensures all goals included
+        tz_name: tzName,
       };
   
       const res = await fetch(`${base}/api/run_daily_autopilot`, {
@@ -496,61 +495,61 @@ export default function AppHome() {
   }
   
 
-  // ✅ Commit Autopilot plan to calendar AFTER user accepts it
-  async function commitAutopilotToCalendar() {
-    if (!userId || !autopilot?.agent_run_id) return;
+  // // ✅ Commit Autopilot plan to calendar AFTER user accepts it
+  // async function commitAutopilotToCalendar() {
+  //   if (!userId || !autopilot?.agent_run_id) return;
 
-    setCommittingCalendar(true);
-    setMsg(null);
+  //   setCommittingCalendar(true);
+  //   setMsg(null);
 
-    try {
-      // Preferred: a dedicated endpoint that schedules an existing agent_run_id
-      const res = await fetch(`${base}/api/calendar/commit_autopilot`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_id: userId,
-          agent_run_id: autopilot.agent_run_id,
-          start_in_minutes: startInMinutes,
-        }),
-      });
+  //   try {
+  //     // Preferred: a dedicated endpoint that schedules an existing agent_run_id
+  //     const res = await fetch(`${base}/api/calendar/commit_autopilot`, {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({
+  //         user_id: userId,
+  //         agent_run_id: autopilot.agent_run_id,
+  //         start_in_minutes: startInMinutes,
+  //       }),
+  //     });
 
-      if (!res.ok) {
-        // If you haven't added the commit endpoint yet, you’ll see an error here.
-        throw new Error(await res.text());
-      }
+  //     if (!res.ok) {
+  //       // If you haven't added the commit endpoint yet, you’ll see an error here.
+  //       throw new Error(await res.text());
+  //     }
 
-      const data = await res.json();
-      setAutopilot((prev) =>
-        prev
-          ? {
-              ...prev,
-              calendar_events: data.calendar_events ?? prev.calendar_events ?? [],
-              calendar_error: data.calendar_error ?? null,
-            }
-          : prev
-      );
+  //     const data = await res.json();
+  //     setAutopilot((prev) =>
+  //       prev
+  //         ? {
+  //             ...prev,
+  //             calendar_events: data.calendar_events ?? prev.calendar_events ?? [],
+  //             calendar_error: data.calendar_error ?? null,
+  //           }
+  //         : prev
+  //     );
 
-      setToast("✅ Added to Google Calendar");
-    } catch (e: any) {
-      setMsg(
-        e?.message ??
-          "Calendar commit failed. Ensure backend has POST /api/calendar/commit_autopilot."
-      );
-    } finally {
-      setCommittingCalendar(false);
-    }
-  }
+  //     setToast("✅ Added to Google Calendar");
+  //   } catch (e: any) {
+  //     setMsg(
+  //       e?.message ??
+  //         "Calendar commit failed. Ensure backend has POST /api/calendar/commit_autopilot."
+  //     );
+  //   } finally {
+  //     setCommittingCalendar(false);
+  //   }
+  // }
 
   // ✅ Commit Daily schedule to calendar AFTER user accepts it
   async function commitDailyToCalendar() {
     if (!userId || !dailyAutopilot?.daily_run_id) return;
-
+  
     setCommittingCalendar(true);
     setMsg(null);
-
+  
     try {
-      const res = await fetch(`${base}/api/calendar/commit_daily`, {
+      const res = await fetch(`${base}/api/daily/commit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -559,30 +558,23 @@ export default function AppHome() {
           start_in_minutes: startInMinutes,
         }),
       });
-
+  
       if (!res.ok) throw new Error(await res.text());
-
-      const data = await res.json();
-      setDailyAutopilot((prev) =>
-        prev
-          ? {
-              ...prev,
-              calendar_events: data.calendar_events ?? prev.calendar_events ?? [],
-              calendar_error: data.calendar_error ?? null,
-            }
-          : prev
-      );
-
+  
+      const data = (await res.json()) as DailyAutopilotResult;
+  
+      // backend returns updated schedule + calendar_events
+      setDailyAutopilot(data);
+  
       setToast("✅ Daily schedule added to Google Calendar");
     } catch (e: any) {
-      setMsg(
-        e?.message ??
-          "Calendar commit failed. Ensure backend has POST /api/calendar/commit_daily."
-      );
+      setMsg(e?.message ?? String(e));
     } finally {
       setCommittingCalendar(false);
     }
   }
+  
+
 
   const dailyChecklistStats = useMemo(() => {
     const items = dailyAutopilot?.items ?? [];
@@ -741,7 +733,7 @@ export default function AppHome() {
 
             </div>
 
-            {/* ✅ Single-goal autopilot card: preview → accept → commit to calendar */}
+            {/* ✅ Single-goal autopilot card: preview → accept → commit to calendar
             {autopilot && (
               <div className="mt-4 border rounded p-4">
                 <div className="flex items-center justify-between">
@@ -881,7 +873,7 @@ export default function AppHome() {
                   <p className="mt-1 text-xs text-gray-600">opik_trace_id: {autopilot.opik_trace_id}</p>
                 )}
               </div>
-            )}
+            )} */}
 
             {/* Daily autopilot card: checklist + schedule preview → accept → commit to calendar */}
             {dailyAutopilot && (
