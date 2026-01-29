@@ -86,8 +86,10 @@ type RunRow = {
 };
 
 function todayISODate() {
-  return new Date().toISOString().slice(0, 10);
+  // local YYYY-MM-DD
+  return new Date().toLocaleDateString("en-CA");
 }
+
 
 type CalendarStatus = {
   connected: boolean;
@@ -161,6 +163,9 @@ function CalendarIntegration({ userId }: { userId: string }) {
 export default function AppHome() {
   const router = useRouter();
   const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+
+  const tzName = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone, []);
+
 
   const [email, setEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
@@ -470,8 +475,7 @@ export default function AppHome() {
         workload,
         blockers: blockers.trim() ? blockers.trim() : null,
         completed,
-
-        // ✅ IMPORTANT: preview-only. Calendar commit happens AFTER user accepts plan.
+        tz_name: tzName,
         schedule_calendar: false,
         start_in_minutes: startInMinutes,
       };
@@ -516,13 +520,10 @@ export default function AppHome() {
         energy,
         workload,
         blockers: blockers.trim() ? blockers.trim() : null,
-
-        // ✅ preview-only
         schedule_calendar: false,
         start_in_minutes: startInMinutes,
-
-        // recommended: send all goal ids so backend can enforce coverage
         goal_ids: goals.map((g) => g.id),
+        tz_name: tzName,
       };
 
       const res = await fetch(`${base}/api/run_daily_autopilot`, {

@@ -91,6 +91,7 @@ class RunAutopilotRequest(BaseModel):
     completed: bool = False
     schedule_calendar: bool = False
     start_in_minutes: int = Field(default=5, ge=0, le=180)
+    tz_name: str = "America/Detroit"
 
 
 class FeedbackRequest(BaseModel):
@@ -122,15 +123,13 @@ from typing import Literal
 
 class DailyAutopilotRequest(BaseModel):
     user_id: str
-    # uses your existing checkin fields (one check-in drives the whole day)
     energy: int = Field(ge=1, le=5)
     workload: int = Field(ge=1, le=5)
     blockers: Optional[str] = None
-
     schedule_calendar: bool = False
     start_in_minutes: int = Field(default=5, ge=0, le=180)
-    # optional override: if provided, plan only for these goals
     goal_ids: Optional[List[str]] = None
+    
 
 class DailyPlanItem(BaseModel):
     item_id: Optional[str] = None  # ✅ for checklist + event mapping
@@ -403,7 +402,7 @@ def schedule_calendar_from_steps(
     try:
         if ZoneInfo:
             now_local = datetime.now(ZoneInfo("America/Detroit"))
-            tz_name = "America/Detroit"
+            tz_name = tz_name
         else:
             now_local = datetime.now(timezone.utc)
             tz_name = "UTC"
@@ -1622,8 +1621,12 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
     try:
         # timezone
         if ZoneInfo:
-            now_local = datetime.now(ZoneInfo("America/Detroit"))
-            tz_name = "America/Detroit"
+            tz_name = req.tz_name or "America/Detroit"
+            try:
+                now_local = datetime.now(ZoneInfo(tz_name)) if ZoneInfo else datetime.now(timezone.utc)
+            except Exception:
+                tz_name = "UTC"
+                now_local = datetime.now(timezone.utc)
         else:
             now_local = datetime.now(timezone.utc)
             tz_name = "UTC"
@@ -1690,7 +1693,6 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 class DailyReviseRequest(BaseModel):
