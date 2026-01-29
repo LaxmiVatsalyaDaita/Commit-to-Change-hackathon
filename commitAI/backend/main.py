@@ -14,6 +14,7 @@ from supabase import create_client, Client
 from openai import OpenAI
 from opik import track, opik_context
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -91,7 +92,7 @@ class RunAutopilotRequest(BaseModel):
     completed: bool = False
     schedule_calendar: bool = False
     start_in_minutes: int = Field(default=5, ge=0, le=180)
-    tz_name: str = "America/Detroit"
+    tz_name: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -129,6 +130,7 @@ class DailyAutopilotRequest(BaseModel):
     schedule_calendar: bool = False
     start_in_minutes: int = Field(default=5, ge=0, le=180)
     goal_ids: Optional[List[str]] = None
+    tz_name: Optional[str] = None
     
 
 class DailyPlanItem(BaseModel):
@@ -193,6 +195,29 @@ class DailyAutopilotResult(BaseModel):
 # -------------------------
 def _dump_model(m: BaseModel) -> dict:
     return m.model_dump() if hasattr(m, "model_dump") else m.dict()
+
+def _safe_tz(tz_name: Optional[str]) -> str:
+    # fall back to Detroit if invalid
+    if not tz_name:
+        return "America/Detroit"
+    try:
+        ZoneInfo(tz_name)
+        return tz_name
+    except Exception:
+        return "America/Detroit"
+
+def _to_local_naive(dt: datetime, tz_name: str) -> datetime:
+    """
+    Make sure Google gets a LOCAL wall-clock time + timezone separately.
+    Avoids weird shifts when mixing aware datetimes + timeZone field.
+    """
+    tz = ZoneInfo(tz_name)
+    if dt.tzinfo is None:
+        dt_local = dt.replace(tzinfo=tz)
+    else:
+        dt_local = dt.astimezone(tz)
+    return dt_local.replace(tzinfo=None)
+
 
 
 def _json_load_or_raise(text: str, where: str) -> dict:
@@ -1573,7 +1598,7 @@ def run_autopilot(req: RunAutopilotRequest):
                 agent_run_id=agent_run_id,
                 steps=steps,
                 start_in_minutes=int(req.start_in_minutes or 5),
-                tz_name="America/Detroit",
+                tz_name = _safe_tz(req.tz_name)
             )
             calendar_events = cal["calendar_events"]
             calendar_error = cal["calendar_error"]
@@ -1619,17 +1644,9 @@ def run_autopilot(req: RunAutopilotRequest):
 @app.post("/api/run_daily_autopilot")
 def run_daily_autopilot(req: DailyAutopilotRequest):
     try:
-        # timezone
-        if ZoneInfo:
-            tz_name = req.tz_name or "America/Detroit"
-            try:
-                now_local = datetime.now(ZoneInfo(tz_name)) if ZoneInfo else datetime.now(timezone.utc)
-            except Exception:
-                tz_name = "UTC"
-                now_local = datetime.now(timezone.utc)
-        else:
-            now_local = datetime.now(timezone.utc)
-            tz_name = "UTC"
+        tz_name = _safe_tz(req.tz_name)
+        now_local = datetime.now(ZoneInfo(tz_name))
+
 
         # load goals (all or subset)
         q = sb.table("goals").select("id,title,cadence_per_day").eq("user_id", req.user_id)
@@ -1858,8 +1875,8 @@ def daily_commit(req: DailyCommitRequest):
                     user_id=req.user_id,
                     title=f"commitAI: {blk['title']}",
                     details=blk.get("details", ""),
-                    start=start_dt,
-                    end=end_dt,
+                    start=_to_local_naive(start_dt, tz_name),
+                    end=_to_local_naive(end_dt, tz_name),
                     time_zone=tz_name,
                 )
                 calendar_events.append({
