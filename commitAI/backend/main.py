@@ -1858,6 +1858,7 @@ def daily_commit(req: DailyCommitRequest):
             raise HTTPException(status_code=400, detail="daily_run has no plan items")
 
         # timezone
+        tz_name = _safe_tz(req.tz_name)
         if ZoneInfo:
             now_local = datetime.now(ZoneInfo(tz_name))
             tz_name = _safe_tz(req.tz_name)
