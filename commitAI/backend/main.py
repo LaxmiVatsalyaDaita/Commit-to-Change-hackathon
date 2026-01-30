@@ -436,7 +436,7 @@ def schedule_calendar_from_steps(
         if ZoneInfo:
             tz_name = _safe_tz(tz_name)
             now_local = datetime.now(ZoneInfo("America/Detroit"))
-            tz_name = tz_name
+            
         else:
             now_local = datetime.now(timezone.utc)
             tz_name = "UTC"
