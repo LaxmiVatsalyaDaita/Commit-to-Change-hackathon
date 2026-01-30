@@ -1861,7 +1861,6 @@ def daily_commit(req: DailyCommitRequest):
         tz_name = _safe_tz(req.tz_name)
         if ZoneInfo:
             now_local = datetime.now(ZoneInfo(tz_name))
-            tz_name = _safe_tz(req.tz_name)
         else:
             now_local = datetime.now(timezone.utc)
             tz_name = "UTC"
