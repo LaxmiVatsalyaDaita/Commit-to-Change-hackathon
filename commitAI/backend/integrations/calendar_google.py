@@ -293,3 +293,15 @@ def google_create_event(
         raise HTTPException(status_code=400, detail=r.text)
 
     return r.json()
+
+def google_delete_event(user_id: str, event_id: str) -> None:
+    sb = _sb()
+    token = google_access_token(user_id)
+    cal_id = (_get_integration(sb, user_id, "google") or {}).get("calendar_id") or "primary"
+
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{event_id}"
+    r = requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+
+    # 204 is success
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=400, detail=r.text)

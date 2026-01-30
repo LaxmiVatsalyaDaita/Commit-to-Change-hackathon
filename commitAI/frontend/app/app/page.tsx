@@ -160,6 +160,8 @@ function CalendarIntegration({ userId }: { userId: string }) {
   );
 }
 
+
+
 export default function AppHome() {
   const router = useRouter();
   const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -575,6 +577,40 @@ export default function AppHome() {
       setCommittingCalendar(false);
     }
   }
+
+  
+  async function checkinAndReschedule() {
+    if (!userId || !dailyAutopilot?.daily_run_id) return;
+  
+    setRunningAutopilot(true);
+    setMsg(null);
+  
+    try {
+      const res = await fetch(`${base}/api/daily/checkin_reschedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          daily_run_id: dailyAutopilot.daily_run_id,
+          energy,
+          workload,
+          blockers: blockers.trim() ? blockers.trim() : null,
+          completed_item_ids: Object.keys(checkedItemIds).filter((k) => checkedItemIds[k]),
+          tz_name: tzName,
+        }),
+      });
+  
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+  
+      setDailyAutopilot(data);
+      setToast("✅ Rescheduled based on your check-in");
+    } catch (e: any) {
+      setMsg(e?.message ?? String(e));
+    } finally {
+      setRunningAutopilot(false);
+    }
+  }
   
 
 
@@ -896,6 +932,15 @@ export default function AppHome() {
                   >
                     {committingCalendar ? "Adding…" : "✅ Add daily schedule to Google Calendar"}
                   </button>
+                  <button
+                    type="button"
+                    className="border rounded px-3 py-2 text-sm"
+                    onClick={checkinAndReschedule}
+                    disabled={runningAutopilot}
+                  >
+                    {runningAutopilot ? "Rescheduling…" : "🔁 Check-in + Reschedule"}
+                  </button>
+
                 </div>
 
                 {/* ✅ Checklist */}
@@ -1083,3 +1128,4 @@ export default function AppHome() {
     </main>
   );
 }
+

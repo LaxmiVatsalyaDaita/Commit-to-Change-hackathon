@@ -24,6 +24,7 @@ except Exception:
 from integrations.calendar_google import (
     register_google_calendar_routes,
     google_create_event,
+    google_delete_event,
 )
 
 # -------------------------
@@ -187,7 +188,15 @@ class DailyAutopilotResult(BaseModel):
     per_goal: List[dict] = []  # traceability for judges (state/agent per goal)
     calendar_events: List[dict] = []
     calendar_error: Optional[str] = None
-
+    
+class DailyRescheduleRequest(BaseModel):
+    user_id: str
+    daily_run_id: str
+    energy: int = Field(ge=1, le=5)
+    workload: int = Field(ge=1, le=5)
+    blockers: Optional[str] = None
+    completed_item_ids: List[str] = []
+    tz_name: Optional[str] = None
 
 
 # -------------------------
@@ -1129,6 +1138,103 @@ Recent memory:
 
     return plan
 
+
+@track(project_name=OPIK_PROJECT, name="daily_rescheduler_llm", flush=True)
+def daily_rescheduler_llm(
+    *,
+    req_payload: dict,
+    goals: List[dict],
+    memory: str,
+    prev_plan: dict,
+    completed_item_ids: List[str],
+    now_local_iso: str,
+) -> dict:
+    """
+    Reschedule for the REST OF TODAY:
+    - Remove completed items
+    - Revise remaining items based on new check-in (energy/workload/blockers)
+    - Keep item_id stable when possible
+    """
+    # shrink prev_plan so prompt stays small
+    prev_items = (prev_plan.get("items") or [])[:20]
+    completed_set = set(completed_item_ids or [])
+
+    completed_titles = []
+    for it in prev_items:
+        if it.get("item_id") in completed_set:
+            completed_titles.append({"item_id": it.get("item_id"), "title": it.get("title")})
+
+    prompt = f"""
+You are CommitAI Daily Rescheduler.
+
+Goal: Update the plan for the REST OF TODAY based on:
+- User's new check-in state
+- What items were completed so far
+- Keep the plan cohesive across all goals
+
+Return ONLY valid JSON:
+{{
+  "summary": "...",
+  "items": [
+    {{
+      "item_id": "string or null",
+      "title": "...",
+      "minutes": 25,
+      "details": "...",
+      "goal_ids": ["..."],
+      "kind": "focus" | "habit",
+      "window": "morning" | "midday" | "afternoon" | "evening" | "any",
+      "occurrences": 1,
+      "min_gap_minutes": 120
+    }}
+  ]
+}}
+
+Hard rules:
+- EXCLUDE completed items (completed_item_ids listed below).
+- For remaining items, KEEP item_id the same if you keep that item (stability matters).
+- You MAY reorder items, shorten/expand minutes, change windows, or add new items.
+- If energy is low or workload is high, reduce total load (shorter plan, fewer focus blocks).
+- If blockers exist, include an early action that reduces blockers.
+- Habits (like water) should be kind="habit" with occurrences>1 and min_gap_minutes>=90.
+- Cover all goals reasonably: every goal should appear in at least one remaining item (unless the day is clearly overloaded — then keep at least the most important per goal).
+- Max 20 items. JSON only. No markdown. No extra keys.
+
+Now (local): {now_local_iso}
+
+User state:
+energy={req_payload.get("energy")}
+workload={req_payload.get("workload")}
+blockers={req_payload.get("blockers")}
+
+Goals (id/title/cadence):
+{json.dumps(goals)}
+
+Completed items (ids + titles):
+{json.dumps(completed_titles)}
+
+completed_item_ids:
+{json.dumps(list(completed_set))}
+
+Previous plan (items):
+{json.dumps(prev_items)}
+
+Recent memory:
+{memory[:1500]}
+"""
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.25,
+    )
+    text = resp.choices[0].message.content or "{}"
+    plan = _validate_daily_plan_json(text)
+    return plan
+
+
+
 @track(project_name=OPIK_PROJECT, name="daily_reviser_llm", flush=True)
 def daily_reviser_llm(*, req_payload: dict, goals: List[dict], memory: str, prev_plan: dict, feedback: str) -> dict:
     prompt = f"""
@@ -1964,3 +2070,198 @@ def daily_commit(req: DailyCommitRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+    
+@app.post("/api/daily/checkin_reschedule")
+def daily_checkin_reschedule(req: DailyRescheduleRequest):
+    """
+    WOW v2:
+    - LLM revises remaining items based on check-in + progress
+    - deterministic schedule from "now"
+    - if already committed: delete future events and recreate
+    """
+    try:
+        # 1) load daily_run
+        row = (
+            sb.table("daily_runs")
+            .select("id,user_id,run_date,plan_json,schedule_json")
+            .eq("id", req.daily_run_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="daily_run not found")
+        row = row[0]
+        if row.get("user_id") != req.user_id:
+            raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
+
+        prev_plan = row.get("plan_json") or {}
+        prev_meta = prev_plan.get("_meta") or {}
+        prev_items = prev_plan.get("items") or []
+        prev_schedule = row.get("schedule_json") or []
+
+        tz_name = _safe_tz(req.tz_name)
+        now_local = datetime.now(ZoneInfo(tz_name))
+        now_local_iso = now_local.isoformat()
+
+        # 2) load goals (prefer goals referenced by this plan)
+        plan_goal_ids = set()
+        for it in prev_items:
+            for gid in (it.get("goal_ids") or []):
+                plan_goal_ids.add(gid)
+
+        all_goals = (
+            sb.table("goals")
+            .select("id,title,cadence_per_day")
+            .eq("user_id", req.user_id)
+            .execute()
+            .data
+            or []
+        )
+        goals = [g for g in all_goals if g.get("id") in plan_goal_ids] or all_goals
+        if not goals:
+            raise HTTPException(status_code=400, detail="No goals found for user")
+
+        # 3) build req payload + memory
+        req_payload = {
+            "user_id": req.user_id,
+            "daily_run_id": req.daily_run_id,
+            "energy": req.energy,
+            "workload": req.workload,
+            "blockers": req.blockers,
+        }
+        memory = _build_daily_memory(sb, req.user_id, goals)
+
+        completed_ids = list(dict.fromkeys(req.completed_item_ids or []))  # stable unique
+
+        # 4) LLM revise remaining items
+        plan = daily_rescheduler_llm(
+            req_payload=req_payload,
+            goals=goals,
+            memory=memory,
+            prev_plan=prev_plan,
+            completed_item_ids=completed_ids,
+            now_local_iso=now_local_iso,
+        )
+        plan = _ensure_item_ids(plan)
+        plan = _inject_habit_items_if_missing(plan, goals)
+
+        # 5) schedule deterministically from now (start_in_minutes = 0)
+        buffer = 10 if int(req.workload) >= 4 else 5
+        schedule = schedule_daily_items(
+            plan["items"],
+            now_local=now_local,
+            start_in_minutes=0,
+            buffer_minutes=buffer,
+        )
+
+        # 6) If committed: delete FUTURE events from old schedule and create new ones
+        calendar_events = []
+        calendar_error = None
+
+        status_prev = str(prev_meta.get("status") or "DRAFT").upper()
+        was_committed = status_prev == "COMMITTED"
+
+        if was_committed:
+            try:
+                # delete only future commitAI events we created (those with event_id)
+                for blk in prev_schedule:
+                    eid = blk.get("event_id")
+                    if not eid:
+                        continue
+                    try:
+                        st = datetime.fromisoformat(str(blk.get("start")))
+                    except Exception:
+                        continue
+                    # only delete events that start after now
+                    if st.tzinfo is None:
+                        # if stored without tz, treat as future-safe by comparing string is risky; skip
+                        continue
+                    if st > now_local:
+                        try:
+                            google_delete_event(req.user_id, eid)
+                        except Exception:
+                            # don't fail the whole reschedule if one delete fails
+                            pass
+
+                # recreate events for new schedule
+                for blk in schedule:
+                    start_dt = datetime.fromisoformat(blk["start"])
+                    end_dt = datetime.fromisoformat(blk["end"])
+
+                    evt = google_create_event(
+                        user_id=req.user_id,
+                        title=f"commitAI: {blk['title']}",
+                        details=blk.get("details", ""),
+                        start=start_dt,   # tz-aware
+                        end=end_dt,       # tz-aware
+                        time_zone=tz_name,
+                    )
+
+                    calendar_events.append({
+                        "item_id": blk.get("item_id"),
+                        "step_title": blk["title"],
+                        "event_id": evt.get("id"),
+                        "htmlLink": evt.get("htmlLink"),
+                        "start": blk["start"],
+                        "end": blk["end"],
+                    })
+
+                # enrich schedule with event ids
+                ev_by_key = {(e.get("item_id"), e.get("step_title")): e for e in calendar_events}
+                enriched_schedule = []
+                for blk in schedule:
+                    e = ev_by_key.get((blk.get("item_id"), blk.get("title")))
+                    enriched_schedule.append({
+                        **blk,
+                        "event_id": e.get("event_id") if e else None,
+                        "htmlLink": e.get("htmlLink") if e else None,
+                    })
+                schedule = enriched_schedule
+
+            except Exception as e:
+                calendar_error = str(e)
+
+        # 7) persist updated plan + schedule (update in place)
+        next_version = int(prev_meta.get("version") or 1) + 1
+        new_meta = {
+            **prev_meta,
+            "status": "COMMITTED" if was_committed else "DRAFT",
+            "version": next_version,
+            "tz": tz_name,
+            "rescheduled_at": datetime.now(timezone.utc).isoformat(),
+            "checkin_snapshot": {
+                "energy": req.energy,
+                "workload": req.workload,
+                "blockers": (req.blockers or "")[:500],
+                "completed_item_ids": completed_ids,
+                "now_local": now_local_iso,
+            },
+        }
+
+        plan_to_store = {**plan, "_meta": new_meta}
+
+        sb.table("daily_runs").update({
+            "plan_json": plan_to_store,
+            "schedule_json": schedule,
+            "summary": plan.get("summary") or "",
+        }).eq("id", req.daily_run_id).execute()
+
+        return {
+            "daily_run_id": req.daily_run_id,
+            "status": new_meta["status"],
+            "version": next_version,
+            "summary": plan.get("summary") or "",
+            "items": plan.get("items") or [],
+            "schedule": schedule,
+            "calendar_events": calendar_events,
+            "calendar_error": calendar_error,
+        }
+
+    except (ValidationError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
