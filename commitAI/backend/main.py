@@ -427,12 +427,14 @@ def schedule_calendar_from_steps(
     sb: Client,
     goal_id: Optional[str] = None,
     agent_run_id: Optional[str] = None,
+    tz_name: Optional[str] = None,
 ) -> tuple[list, Optional[str]]:
     calendar_events = []
     calendar_error = None
 
     try:
         if ZoneInfo:
+            tz_name = _safe_tz(tz_name)
             now_local = datetime.now(ZoneInfo("America/Detroit"))
             tz_name = tz_name
         else:
