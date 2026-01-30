@@ -556,8 +556,10 @@ export default function AppHome() {
           user_id: userId,
           daily_run_id: dailyAutopilot.daily_run_id,
           start_in_minutes: startInMinutes,
+          tz_name: tzName, // ✅ ADD THIS LINE
         }),
       });
+      
   
       if (!res.ok) throw new Error(await res.text());
   

@@ -205,6 +205,13 @@ def _safe_tz(tz_name: Optional[str]) -> str:
         return tz_name
     except Exception:
         return "America/Detroit"
+    
+def _ensure_tz_aware(dt: datetime, tz_name: str) -> datetime:
+    tz = ZoneInfo(tz_name)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
 
 def _to_local_naive(dt: datetime, tz_name: str) -> datetime:
     """
@@ -1823,6 +1830,7 @@ class DailyCommitRequest(BaseModel):
     user_id: str
     daily_run_id: str
     start_in_minutes: int = Field(default=5, ge=0, le=180)
+    tz_name: Optional[str] = None
 
 @app.post("/api/daily/commit")
 def daily_commit(req: DailyCommitRequest):
@@ -1849,8 +1857,8 @@ def daily_commit(req: DailyCommitRequest):
 
         # timezone
         if ZoneInfo:
-            now_local = datetime.now(ZoneInfo("America/Detroit"))
-            tz_name = "America/Detroit"
+            now_local = datetime.now(ZoneInfo(tz_name))
+            tz_name = _safe_tz(req.tz_name)
         else:
             now_local = datetime.now(timezone.utc)
             tz_name = "UTC"
@@ -1869,16 +1877,18 @@ def daily_commit(req: DailyCommitRequest):
         try:
             # create events for all blocks >= 2 min (habits like water will show too)
             for blk in schedule:
-                start_dt = datetime.fromisoformat(blk["start"])
-                end_dt = datetime.fromisoformat(blk["end"])
+                start_dt = _ensure_tz_aware(datetime.fromisoformat(blk["start"]), tz_name)
+                end_dt   = _ensure_tz_aware(datetime.fromisoformat(blk["end"]), tz_name)
+
                 evt = google_create_event(
                     user_id=req.user_id,
                     title=f"commitAI: {blk['title']}",
                     details=blk.get("details", ""),
-                    start=_to_local_naive(start_dt, tz_name),
-                    end=_to_local_naive(end_dt, tz_name),
+                    start=start_dt,
+                    end=end_dt,
                     time_zone=tz_name,
                 )
+
                 calendar_events.append({
                     "item_id": blk.get("item_id"),
                     "step_title": blk["title"],
@@ -1890,7 +1900,7 @@ def daily_commit(req: DailyCommitRequest):
 
             # add a final “check-in” event at end of last block
             if schedule:
-                last_end = datetime.fromisoformat(schedule[-1]["end"])
+                last_end = _ensure_tz_aware(datetime.fromisoformat(schedule[-1]["end"]), tz_name)
                 chk_evt = google_create_event(
                     user_id=req.user_id,
                     title="commitAI: quick check-in",
@@ -1899,6 +1909,7 @@ def daily_commit(req: DailyCommitRequest):
                     end=last_end + timedelta(minutes=5),
                     time_zone=tz_name,
                 )
+
                 calendar_events.append({
                     "item_id": None,
                     "step_title": "quick check-in",
