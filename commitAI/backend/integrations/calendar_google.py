@@ -6,6 +6,7 @@ import requests
 from urllib.parse import urlencode
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException
 from supabase import Client
@@ -254,6 +255,18 @@ def google_create_event(
     end: datetime,
     time_zone: str = "America/Detroit",
 ) -> dict:
+    
+    tz = ZoneInfo(time_zone)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=tz)
+    else:
+        start = start.astimezone(tz)
+
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=tz)
+    else:
+        end = end.astimezone(tz)
+
     if end <= start:
         raise HTTPException(status_code=400, detail="Event end must be after start")
 
