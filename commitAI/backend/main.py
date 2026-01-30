@@ -433,8 +433,8 @@ def schedule_calendar_from_steps(
     calendar_error = None
 
     try:
+        tz_name = _safe_tz(tz_name)
         if ZoneInfo:
-            tz_name = _safe_tz(tz_name)
             now_local = datetime.now(ZoneInfo("America/Detroit"))
             
         else:
