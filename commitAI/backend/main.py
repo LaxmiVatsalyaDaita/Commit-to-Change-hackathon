@@ -447,7 +447,7 @@ def schedule_calendar_from_steps(
     try:
         tz_name = _safe_tz(tz_name)
         if ZoneInfo:
-            now_local = datetime.now(ZoneInfo("America/Detroit"))
+            now_local = datetime.now(ZoneInfo(tz_name))
             
         else:
             now_local = datetime.now(timezone.utc)
@@ -2034,14 +2034,41 @@ class DailyCommitRequest(BaseModel):
 
 @app.post("/api/daily/commit")
 def daily_commit(req: DailyCommitRequest):
+    plan: dict = {}  # ✅ always defined (prevents UnboundLocalError)
     try:
-        
-        # ✅ Use timezone from saved plan meta if available
-        meta = (plan.get("_meta") or {})
-        tz_name = _safe_tz(meta.get("tz") or "America/Detroit")
-        now_local = datetime.now(ZoneInfo(tz_name))
+        # 1) load daily_run FIRST
+        rows = (
+            sb.table("daily_runs")
+            .select("id,user_id,run_date,plan_json")
+            .eq("id", req.daily_run_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="daily_run not found")
 
-        # ✅ Delete today's commitAI events first (only ours)
+        row = rows[0]
+        if row.get("user_id") != req.user_id:
+            raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
+
+        plan = row.get("plan_json") or {}
+        items = plan.get("items") or []
+        if not items:
+            raise HTTPException(status_code=400, detail="daily_run has no plan items")
+
+        # 2) decide timezone (prefer saved plan meta; fallback to request; then default)
+        meta = (plan.get("_meta") or {})
+        tz_name = _safe_tz(meta.get("tz") or req.tz_name or "America/Detroit")
+
+        if ZoneInfo:
+            now_local = datetime.now(ZoneInfo(tz_name))
+        else:
+            now_local = datetime.now(timezone.utc)
+            tz_name = "UTC"
+
+        # 3) delete TODAY’s commitAI events first (only ours)
         day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1)
 
@@ -2051,35 +2078,7 @@ def daily_commit(req: DailyCommitRequest):
             time_max=day_end,
         )
 
-        row = (
-            sb.table("daily_runs")
-            .select("id,user_id,run_date,plan_json")
-            .eq("id", req.daily_run_id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="daily_run not found")
-        row = row[0]
-        if row.get("user_id") != req.user_id:
-            raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
-
-        plan = row.get("plan_json") or {}
-        items = plan.get("items") or []
-        if not items:
-            raise HTTPException(status_code=400, detail="daily_run has no plan items")
-
-        # timezone
-        tz_name = _safe_tz(req.tz_name)
-        if ZoneInfo:
-            now_local = datetime.now(ZoneInfo(tz_name))
-        else:
-            now_local = datetime.now(timezone.utc)
-            tz_name = "UTC"
-
-        # recompute schedule at commit time (so times are fresh)
+        # 4) recompute schedule at commit time (fresh times)
         schedule = schedule_daily_items(
             items,
             now_local=now_local,
@@ -2090,21 +2089,24 @@ def daily_commit(req: DailyCommitRequest):
         calendar_events = []
         calendar_error = None
 
+        # 5) create events
         try:
+            tz = ZoneInfo(tz_name) if ZoneInfo else timezone.utc
+
             for blk in schedule:
                 start_dt = datetime.fromisoformat(blk["start"])
                 end_dt = datetime.fromisoformat(blk["end"])
 
-                # ✅ force to tz-aware in tz_name
+                # ✅ ensure tz-aware
                 if start_dt.tzinfo is None:
-                    start_dt = start_dt.replace(tzinfo=ZoneInfo(tz_name))
+                    start_dt = start_dt.replace(tzinfo=tz)
                 else:
-                    start_dt = start_dt.astimezone(ZoneInfo(tz_name))
+                    start_dt = start_dt.astimezone(tz)
 
                 if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=ZoneInfo(tz_name))
+                    end_dt = end_dt.replace(tzinfo=tz)
                 else:
-                    end_dt = end_dt.astimezone(ZoneInfo(tz_name))
+                    end_dt = end_dt.astimezone(tz)
 
                 evt = google_create_event(
                     user_id=req.user_id,
@@ -2124,13 +2126,13 @@ def daily_commit(req: DailyCommitRequest):
                     "end": blk["end"],
                 })
 
-            # optional: add check-in at end
+            # optional: add quick check-in
             if schedule:
                 last_end = datetime.fromisoformat(schedule[-1]["end"])
                 if last_end.tzinfo is None:
-                    last_end = last_end.replace(tzinfo=ZoneInfo(tz_name))
+                    last_end = last_end.replace(tzinfo=tz)
                 else:
-                    last_end = last_end.astimezone(ZoneInfo(tz_name))
+                    last_end = last_end.astimezone(tz)
 
                 chk_evt = google_create_event(
                     user_id=req.user_id,
@@ -2152,22 +2154,18 @@ def daily_commit(req: DailyCommitRequest):
         except Exception as e:
             calendar_error = str(e)
 
-
-        # mark committed by updating plan_json meta + store committed schedule with event ids
+        # 6) mark committed + store enriched schedule
         meta = plan.get("_meta") or {}
         meta["status"] = "COMMITTED"
         meta["committed_at"] = datetime.now(timezone.utc).isoformat()
+        meta["tz"] = tz_name
         plan["_meta"] = meta
 
-        # enrich schedule with event_id/htmlLink if we can match by item_id + title
-        ev_by_key = {}
-        for e in calendar_events:
-            ev_by_key[(e.get("item_id"), e.get("step_title"))] = e
+        ev_by_key = {(e.get("item_id"), e.get("step_title")): e for e in calendar_events}
 
         enriched_schedule = []
         for blk in schedule:
-            key = (blk.get("item_id"), blk.get("title"))
-            e = ev_by_key.get(key)
+            e = ev_by_key.get((blk.get("item_id"), blk.get("title")))
             enriched_schedule.append({
                 **blk,
                 "event_id": e.get("event_id") if e else None,
@@ -2187,13 +2185,17 @@ def daily_commit(req: DailyCommitRequest):
             "schedule": enriched_schedule,
             "calendar_events": calendar_events,
             "calendar_error": calendar_error,
+            "wipe": wipe,
+            "tz_used": tz_name,
         }
 
     except (ValidationError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
     
 @app.post("/api/daily/checkin_reschedule")
 def daily_checkin_reschedule(req: DailyRescheduleRequest):
