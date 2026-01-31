@@ -284,6 +284,12 @@ def google_create_event(
         "description": details,
         "start": {"dateTime": start.isoformat(), "timeZone": time_zone},
         "end": {"dateTime": end.isoformat(), "timeZone": time_zone},
+        
+        "extendedProperties": {
+            "private": {
+                "commitai": "1"
+            }
+        }
     }
 
     url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events"
@@ -293,6 +299,99 @@ def google_create_event(
         raise HTTPException(status_code=400, detail=r.text)
 
     return r.json()
+
+def google_list_events(user_id: str, *, time_min: datetime, time_max: datetime) -> list:
+    """
+    List events between [time_min, time_max). Requires timezone-aware datetimes.
+    Returns expanded single events.
+    """
+    if time_min.tzinfo is None or time_max.tzinfo is None:
+        raise HTTPException(status_code=400, detail="time_min/time_max must be timezone-aware")
+
+    sb = _sb()
+    token = google_access_token(user_id)
+    cal_id = (_get_integration(sb, user_id, "google") or {}).get("calendar_id") or "primary"
+
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events"
+
+    params = {
+        "timeMin": time_min.isoformat(),
+        "timeMax": time_max.isoformat(),
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": 2500,
+    }
+
+    items = []
+    page_token = None
+    while True:
+        if page_token:
+            params["pageToken"] = page_token
+
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=20)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=400, detail=r.text)
+
+        data = r.json()
+        items.extend(data.get("items", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return items
+
+
+def google_delete_event(user_id: str, *, event_id: str) -> None:
+    sb = _sb()
+    token = google_access_token(user_id)
+    cal_id = (_get_integration(sb, user_id, "google") or {}).get("calendar_id") or "primary"
+
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{event_id}"
+    r = requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=400, detail=r.text)
+
+
+def google_delete_commitai_events_in_range(
+    user_id: str,
+    *,
+    time_min: datetime,
+    time_max: datetime,
+) -> dict:
+    """
+    Deletes ONLY commitAI-created events in the time range.
+    Safer rule:
+      - delete if extendedProperties.private.commitai == "1"
+      - OR fallback: title starts with "commitAI:" (for old events created before tagging)
+    """
+    events = google_list_events(user_id, time_min=time_min, time_max=time_max)
+
+    deleted = 0
+    skipped = 0
+
+    for ev in events:
+        ev_id = ev.get("id")
+        summary = (ev.get("summary") or "").strip()
+
+        # ignore all-day events (they have "date" instead of "dateTime")
+        start_obj = (ev.get("start") or {})
+        if "dateTime" not in start_obj:
+            skipped += 1
+            continue
+
+        priv = (((ev.get("extendedProperties") or {}).get("private")) or {})
+        is_commitai = (priv.get("commitai") == "1") or summary.startswith("commitAI:")
+
+        if not is_commitai or not ev_id:
+            skipped += 1
+            continue
+
+        google_delete_event(user_id, event_id=ev_id)
+        deleted += 1
+
+    return {"deleted": deleted, "skipped": skipped}
+
 
 def google_delete_event(user_id: str, event_id: str) -> None:
     sb = _sb()

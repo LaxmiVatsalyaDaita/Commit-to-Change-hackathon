@@ -27,6 +27,7 @@ from integrations.calendar_google import (
     register_google_calendar_routes,
     google_create_event,
     google_delete_event,
+    google_delete_commitai_events_in_range,
 )
 
 # -------------------------
@@ -2034,6 +2035,22 @@ class DailyCommitRequest(BaseModel):
 @app.post("/api/daily/commit")
 def daily_commit(req: DailyCommitRequest):
     try:
+        
+        # ✅ Use timezone from saved plan meta if available
+        meta = (plan.get("_meta") or {})
+        tz_name = _safe_tz(meta.get("tz") or "America/Detroit")
+        now_local = datetime.now(ZoneInfo(tz_name))
+
+        # ✅ Delete today's commitAI events first (only ours)
+        day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+
+        wipe = google_delete_commitai_events_in_range(
+            req.user_id,
+            time_min=day_start,
+            time_max=day_end,
+        )
+
         row = (
             sb.table("daily_runs")
             .select("id,user_id,run_date,plan_json")
@@ -2074,10 +2091,20 @@ def daily_commit(req: DailyCommitRequest):
         calendar_error = None
 
         try:
-            # create events for all blocks >= 2 min (habits like water will show too)
             for blk in schedule:
-                start_dt = _ensure_tz_aware(datetime.fromisoformat(blk["start"]), tz_name)
-                end_dt   = _ensure_tz_aware(datetime.fromisoformat(blk["end"]), tz_name)
+                start_dt = datetime.fromisoformat(blk["start"])
+                end_dt = datetime.fromisoformat(blk["end"])
+
+                # ✅ force to tz-aware in tz_name
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=ZoneInfo(tz_name))
+                else:
+                    start_dt = start_dt.astimezone(ZoneInfo(tz_name))
+
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=ZoneInfo(tz_name))
+                else:
+                    end_dt = end_dt.astimezone(ZoneInfo(tz_name))
 
                 evt = google_create_event(
                     user_id=req.user_id,
@@ -2097,9 +2124,14 @@ def daily_commit(req: DailyCommitRequest):
                     "end": blk["end"],
                 })
 
-            # add a final “check-in” event at end of last block
+            # optional: add check-in at end
             if schedule:
-                last_end = _ensure_tz_aware(datetime.fromisoformat(schedule[-1]["end"]), tz_name)
+                last_end = datetime.fromisoformat(schedule[-1]["end"])
+                if last_end.tzinfo is None:
+                    last_end = last_end.replace(tzinfo=ZoneInfo(tz_name))
+                else:
+                    last_end = last_end.astimezone(ZoneInfo(tz_name))
+
                 chk_evt = google_create_event(
                     user_id=req.user_id,
                     title="commitAI: quick check-in",
@@ -2108,7 +2140,6 @@ def daily_commit(req: DailyCommitRequest):
                     end=last_end + timedelta(minutes=5),
                     time_zone=tz_name,
                 )
-
                 calendar_events.append({
                     "item_id": None,
                     "step_title": "quick check-in",
@@ -2120,6 +2151,7 @@ def daily_commit(req: DailyCommitRequest):
 
         except Exception as e:
             calendar_error = str(e)
+
 
         # mark committed by updating plan_json meta + store committed schedule with event ids
         meta = plan.get("_meta") or {}
@@ -2355,6 +2387,13 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+    
+    
+@app.post("/api/calendar/commit_daily")
+def commit_daily_alias(req: DailyCommitRequest):
+    return daily_commit(req)
+
 
 
 class DailyTaskToggleRequest(BaseModel):
