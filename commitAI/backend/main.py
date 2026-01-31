@@ -15,6 +15,8 @@ from openai import OpenAI
 from opik import track, opik_context
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from fastapi import Query
+
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -905,6 +907,66 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
 # -------------------------
 # Endpoints: runs + feedback
 # -------------------------
+
+@app.get("/api/daily/tasks")
+def list_daily_tasks(user_id: str, daily_run_id: str):
+    rows = (
+        sb.table("daily_tasks")
+        .select("item_id,completed,completed_at,title,minutes,kind,window,goal_ids,details")
+        .eq("user_id", user_id)
+        .eq("daily_run_id", daily_run_id)
+        .order("created_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+    return {"tasks": rows}
+
+
+@app.get("/api/daily/today")
+def daily_today(user_id: str, tz_name: str = "America/Detroit"):
+    tz_name = _safe_tz(tz_name)
+    now_local = datetime.now(ZoneInfo(tz_name))
+    today = now_local.date().isoformat()
+
+    rows = (
+        sb.table("daily_runs")
+        .select("id,user_id,run_date,plan_json,schedule_json,created_at")
+        .eq("user_id", user_id)
+        .eq("run_date", today)
+        .order("created_at", desc=True)
+        .limit(5)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return {"found": False}
+
+    # prefer COMMITTED if present, else latest
+    def _status(r):
+        return ((r.get("plan_json") or {}).get("_meta") or {}).get("status") or "DRAFT"
+
+    committed = [r for r in rows if str(_status(r)).upper() == "COMMITTED"]
+    chosen = committed[0] if committed else rows[0]
+
+    plan = chosen.get("plan_json") or {}
+    items = plan.get("items") or []
+    schedule = chosen.get("schedule_json") or []
+
+    return {
+        "found": True,
+        "daily_run_id": chosen.get("id"),
+        "summary": plan.get("summary") or "",
+        "items": items,
+        "schedule": schedule,
+        "calendar_events": [],   # optional
+        "calendar_error": None,  # optional
+        "status": ((plan.get("_meta") or {}).get("status") or "DRAFT"),
+        "version": int(((plan.get("_meta") or {}).get("version") or 1)),
+    }
+
+
 @app.get("/api/runs/recent")
 def recent_runs(user_id: str, limit: int = 10):
     try:
@@ -1808,6 +1870,30 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
         }).execute().data
 
         daily_run_id = (dr or [{}])[0].get("id")
+        
+        # after daily_run_id is computed
+        task_rows = []
+        for it in plan["items"]:
+            task_rows.append({
+                "user_id": req.user_id,
+                "daily_run_id": daily_run_id,
+                "item_id": it["item_id"],   # already a UUID string
+                "title": it["title"],
+                "details": it.get("details", ""),
+                "minutes": int(it.get("minutes", 0)) if it.get("minutes") is not None else None,
+                "kind": it.get("kind", "focus"),
+                "window": it.get("window", "any"),
+                "goal_ids": it.get("goal_ids", []),
+                "completed": False,
+                "completed_at": None,
+            })
+
+        if task_rows:
+            sb.table("daily_tasks").upsert(
+                task_rows,
+                on_conflict="daily_run_id,item_id"
+            ).execute()
+
 
         # ✅ IMPORTANT: do NOT touch calendar here anymore
         return {
@@ -2265,3 +2351,44 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+class DailyTaskToggleRequest(BaseModel):
+    user_id: str
+    daily_run_id: str
+    item_id: str
+    completed: bool
+
+@app.post("/api/daily/task/toggle")
+def toggle_daily_task(req: DailyTaskToggleRequest):
+    try:
+        # verify the task belongs to that user (prevent cross-user updates)
+        row = (
+            sb.table("daily_tasks")
+            .select("id,user_id,completed")
+            .eq("daily_run_id", req.daily_run_id)
+            .eq("item_id", req.item_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="daily_task not found")
+        if row[0]["user_id"] != req.user_id:
+            raise HTTPException(status_code=403, detail="wrong user_id for this task")
+
+        upd = {
+            "completed": bool(req.completed),
+            "completed_at": datetime.now(timezone.utc).isoformat() if req.completed else None,
+        }
+
+        sb.table("daily_tasks").update(upd)\
+          .eq("daily_run_id", req.daily_run_id)\
+          .eq("item_id", req.item_id)\
+          .execute()
+
+        return {"ok": True, **upd}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

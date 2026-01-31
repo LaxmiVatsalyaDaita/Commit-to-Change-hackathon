@@ -239,17 +239,44 @@ export default function AppHome() {
     }
   }
 
-  function toggleItemChecked(itemId: string) {
-    setCheckedItemIds((prev) => {
-      const next = { ...prev, [itemId]: !prev[itemId] };
-      try {
-        localStorage.setItem(checklistKeyForToday(), JSON.stringify(next));
-      } catch {
-        // ignore
-      }
-      return next;
-    });
+  // function toggleItemChecked(itemId: string) {
+  //   setCheckedItemIds((prev) => {
+  //     const next = { ...prev, [itemId]: !prev[itemId] };
+  //     try {
+  //       localStorage.setItem(checklistKeyForToday(), JSON.stringify(next));
+  //     } catch {
+  //       // ignore
+  //     }
+  //     return next;
+  //   });
+  // }
+
+  async function toggleItemChecked(itemId: string) {
+    if (!dailyAutopilot?.daily_run_id || !userId) return;
+  
+    // optimistic UI
+    const nextCompleted = !checkedItemIds[itemId];
+    setCheckedItemIds((prev) => ({ ...prev, [itemId]: nextCompleted }));
+  
+    try {
+      const res = await fetch(`${base}/api/daily/task/toggle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          daily_run_id: dailyAutopilot.daily_run_id,
+          item_id: itemId,
+          completed: nextCompleted,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+    } catch (e: any) {
+      // rollback if it fails
+      setCheckedItemIds((prev) => ({ ...prev, [itemId]: !nextCompleted }));
+      setMsg(e?.message ?? String(e));
+    }
   }
+  
 
   // hydrate checklist whenever a new daily run is loaded
   useEffect(() => {
@@ -289,6 +316,26 @@ export default function AppHome() {
   async function signOut() {
     await supabase.auth.signOut();
   }
+
+  async function loadTodayDailyRun() {
+    if (!userId) return;
+    try {
+      const res = await fetch(
+        `${base}/api/daily/today?user_id=${encodeURIComponent(userId)}&tz_name=${encodeURIComponent(tzName)}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (data?.found) {
+        setDailyAutopilot(data);
+        setToast("✅ Loaded today’s plan");
+      }
+    } catch (e: any) {
+      // don’t hard-fail; just show message if you want
+      // setMsg(e?.message ?? String(e));
+    }
+  }
+  
 
   async function loadGoals() {
     setLoadingGoals(true);
@@ -370,9 +417,18 @@ export default function AppHome() {
     if (userId) {
       loadGoals();
       loadRecentRuns();
+      loadTodayDailyRun(); 
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
+
+  useEffect(() => {
+    if (dailyAutopilot?.daily_run_id) {
+      loadDailyTaskStatuses(dailyAutopilot.daily_run_id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dailyAutopilot?.daily_run_id]);
+  
 
   useEffect(() => {
     if (selectedGoal?.id) loadCheckins(selectedGoal.id);
@@ -455,6 +511,24 @@ export default function AppHome() {
     if (!res.ok) throw new Error(await res.text());
     await loadRecentRuns();
   }
+
+  async function loadDailyTaskStatuses(dailyRunId: string) {
+    if (!userId) return;
+  
+    const res = await fetch(
+      `${base}/api/daily/tasks?user_id=${encodeURIComponent(userId)}&daily_run_id=${encodeURIComponent(dailyRunId)}`,
+      { cache: "no-store" }
+    );
+    if (!res.ok) throw new Error(await res.text());
+  
+    const data = await res.json();
+    const map: Record<string, boolean> = {};
+    for (const t of (data.tasks ?? [])) {
+      map[t.item_id] = !!t.completed;
+    }
+    setCheckedItemIds(map);
+  }
+  
 
   async function runAutopilotAllGoals() {
     if (!userId) return;
