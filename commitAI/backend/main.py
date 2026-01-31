@@ -910,16 +910,21 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
 
 @app.get("/api/daily/tasks")
 def list_daily_tasks(user_id: str, daily_run_id: str):
-    rows = (
+    res = (
         sb.table("daily_tasks")
-        .select("item_id,completed,completed_at,title,minutes,kind,window,goal_ids,details")
+        .select("item_id,completed,completed_at,title,minutes,kind,time_window,goal_ids,details")
         .eq("user_id", user_id)
         .eq("daily_run_id", daily_run_id)
         .order("created_at", desc=False)
         .execute()
-        .data
-        or []
     )
+    rows = res.data or []         
+
+    for r in rows:
+        r["window"] = r.get("time_window")   # keep frontend unchanged
+        # optional: remove the DB field so frontend only sees "window"
+        r.pop("time_window", None)
+        
     return {"tasks": rows}
 
 
@@ -1882,7 +1887,7 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
                 "details": it.get("details", ""),
                 "minutes": int(it.get("minutes", 0)) if it.get("minutes") is not None else None,
                 "kind": it.get("kind", "focus"),
-                "window": it.get("window", "any"),
+                "time_window": it.get("window", "any"),
                 "goal_ids": it.get("goal_ids", []),
                 "completed": False,
                 "completed_at": None,
