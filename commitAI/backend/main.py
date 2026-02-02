@@ -28,6 +28,7 @@ from integrations.calendar_google import (
     google_create_event,
     google_delete_event,
     google_delete_commitai_events_in_range,
+    google_list_events_in_range,
 )
 
 # -------------------------
@@ -336,6 +337,89 @@ def _validate_daily_plan_json(text: str) -> dict:
     plan = DailyPlanOutput.model_validate(obj) if hasattr(DailyPlanOutput, "model_validate") else DailyPlanOutput.parse_obj(obj)
     out = plan.model_dump() if hasattr(plan, "model_dump") else plan.dict()
     return out
+
+
+from typing import Tuple
+
+def _parse_google_event_dt(evt_dt: dict, tz_name: str) -> datetime:
+    """
+    Google event start/end has either:
+      - {"dateTime": "..."} OR
+      - {"date": "YYYY-MM-DD"}  (all-day)
+    Returns tz-aware datetime in tz_name.
+    """
+    tz = ZoneInfo(tz_name)
+    if "dateTime" in evt_dt and evt_dt["dateTime"]:
+        dt = datetime.fromisoformat(evt_dt["dateTime"].replace("Z", "+00:00"))
+        return dt.astimezone(tz)
+    if "date" in evt_dt and evt_dt["date"]:
+        # all-day: treat as busy from start-of-day local
+        d = datetime.fromisoformat(evt_dt["date"])
+        return d.replace(tzinfo=tz)
+    raise ValueError("Unknown event datetime format")
+
+def _get_non_commitai_busy_intervals(
+    user_id: str,
+    *,
+    tz_name: str,
+    start_local: datetime,
+    end_local: datetime,
+    buffer_minutes: int = 5,
+) -> List[Tuple[datetime, datetime]]:
+    """
+    Pull calendar events and return merged busy intervals (tz-aware),
+    excluding commitAI events (summary starts with 'commitAI:').
+    Adds a small buffer around events.
+    """
+    try:
+        events = google_list_events_in_range(
+            user_id=user_id,
+            time_min=start_local,
+            time_max=end_local,
+            time_zone=tz_name,
+        )
+    except Exception:
+        return []
+
+    tz = ZoneInfo(tz_name)
+    busy: List[Tuple[datetime, datetime]] = []
+
+    for e in events:
+        summary = (e.get("summary") or "").strip()
+        if summary.lower().startswith("commitai:"):
+            continue  # ✅ ignore our own
+
+        st_raw = e.get("start") or {}
+        en_raw = e.get("end") or {}
+
+        try:
+            st = _parse_google_event_dt(st_raw, tz_name)
+            en = _parse_google_event_dt(en_raw, tz_name)
+        except Exception:
+            continue
+
+        # Ensure tz-aware
+        if st.tzinfo is None: st = st.replace(tzinfo=tz)
+        if en.tzinfo is None: en = en.replace(tzinfo=tz)
+
+        # add buffer
+        st = st - timedelta(minutes=buffer_minutes)
+        en = en + timedelta(minutes=buffer_minutes)
+
+        if en > st:
+            busy.append((st, en))
+
+    busy.sort(key=lambda x: x[0])
+
+    # merge overlaps
+    merged: List[Tuple[datetime, datetime]] = []
+    for st, en in busy:
+        if not merged or st > merged[-1][1]:
+            merged.append((st, en))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], en))
+
+    return merged
 
 
 def _today_iso_utc() -> str:
@@ -822,12 +906,37 @@ def _day_window_bounds(now_local: datetime, window: str):
     return now_local.replace(hour=9, minute=0, second=0, microsecond=0), now_local.replace(hour=22, minute=0, second=0, microsecond=0)
 
 
-def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_minutes: int, buffer_minutes: int = 5) -> List[dict]:
+def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_minutes: int, buffer_minutes: int = 5,busy: Optional[List[tuple]] = None,) -> List[dict]:
     """
     Deterministic scheduler:
     - focus blocks: placed sequentially starting at cursor within their window
     - habit blocks: spread across window/horizon with min_gap enforcement
     """
+    
+    busy = busy or []
+
+    def _overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+        return a_start < b_end and a_end > b_start
+
+    def _shift_to_free(start_dt: datetime, duration_min: int) -> datetime:
+        """
+        Push start_dt forward until [start, start+duration] doesn't overlap any busy interval.
+        Assumes busy is merged + sorted.
+        """
+        end_dt = start_dt + timedelta(minutes=duration_min)
+
+        i = 0
+        while i < len(busy):
+            b_st, b_en = busy[i]
+            if _overlaps(start_dt, end_dt, b_st, b_en):
+                start_dt = b_en + timedelta(minutes=buffer_minutes)
+                end_dt = start_dt + timedelta(minutes=duration_min)
+                # restart scan (or advance carefully)
+                i = 0
+                continue
+            i += 1
+        return start_dt
+
     cursor = now_local + timedelta(minutes=int(start_in_minutes or 0))
     scheduled: List[dict] = []
 
@@ -840,8 +949,12 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
         w = it.get("window", "any")
         w_start, w_end = _day_window_bounds(now_local, w)
 
+        dur = int(it.get("minutes", 25))
         start_dt = max(cursor, w_start)
-        end_dt = start_dt + timedelta(minutes=int(it.get("minutes", 25)))
+        start_dt = _shift_to_free(start_dt, dur)   # ✅ avoid conflicts
+        end_dt = start_dt + timedelta(minutes=dur)
+        
+        t = _shift_to_free(t, dur)
 
         # if it spills beyond window, just keep it (MVP) or clamp later
         scheduled.append({
@@ -1845,6 +1958,24 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
         plan = daily_planner_llm(req_payload=req_payload, goals=goals, memory=memory)
         plan = _ensure_item_ids(plan)
         plan = _inject_habit_items_if_missing(plan, goals)
+        
+        day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+        busy = _get_non_commitai_busy_intervals(
+            req.user_id,
+            tz_name=tz_name,
+            start_local=now_local,
+            end_local=day_end,
+            buffer_minutes=5,
+        )
+
+        schedule = schedule_daily_items(
+            plan["items"],
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
+            busy=busy,  # ✅
+        )
+
 
         schedule = schedule_daily_items(
             plan["items"],
@@ -2077,6 +2208,24 @@ def daily_commit(req: DailyCommitRequest):
             time_min=day_start,
             time_max=day_end,
         )
+        
+        day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+        busy = _get_non_commitai_busy_intervals(
+            req.user_id,
+            tz_name=tz_name,
+            start_local=now_local,
+            end_local=day_end,
+            buffer_minutes=5,
+        )
+
+        schedule = schedule_daily_items(
+            plan["items"],
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
+            busy=busy,  # ✅
+        )
+
 
         # 4) recompute schedule at commit time (fresh times)
         schedule = schedule_daily_items(
@@ -2275,6 +2424,25 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
 
         # 5) schedule deterministically from now (start_in_minutes = 0)
         buffer = 10 if int(req.workload) >= 4 else 5
+        
+        day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+        busy = _get_non_commitai_busy_intervals(
+            req.user_id,
+            tz_name=tz_name,
+            start_local=now_local,
+            end_local=day_end,
+            buffer_minutes=5,
+        )
+
+        schedule = schedule_daily_items(
+            plan["items"],
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
+            busy=busy,  # ✅
+        )
+
+
         schedule = schedule_daily_items(
             plan["items"],
             now_local=now_local,

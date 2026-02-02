@@ -404,3 +404,41 @@ def google_delete_event(user_id: str, event_id: str) -> None:
     # 204 is success
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=400, detail=r.text)
+
+
+# integrations/calendar_google.py
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+def google_list_events_in_range(
+    user_id: str,
+    time_min: datetime,
+    time_max: datetime,
+    time_zone: str = "America/Detroit",
+) -> list[dict]:
+    """
+    Returns calendar events in [time_min, time_max].
+    We will filter out commitAI events in main.py.
+    """
+    sb = _sb()
+    token = google_access_token(user_id)
+    cal_id = (_get_integration(sb, user_id, "google") or {}).get("calendar_id") or "primary"
+
+    if time_min.tzinfo is None or time_max.tzinfo is None:
+        raise HTTPException(status_code=400, detail="time_min/time_max must be tz-aware")
+
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events"
+    params = {
+        "timeMin": time_min.isoformat(),
+        "timeMax": time_max.isoformat(),
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": 2500,
+    }
+
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=20)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=400, detail=r.text)
+
+    data = r.json()
+    return data.get("items") or []
