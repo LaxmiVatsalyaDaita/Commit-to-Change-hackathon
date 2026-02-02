@@ -271,6 +271,39 @@ def _find_plan_obj(obj: Any) -> Optional[dict]:
                 return found
     return None
 
+from datetime import datetime, timedelta
+from typing import List, Tuple
+
+def _push_past_busy(
+    start_dt: datetime,
+    duration_min: int,
+    busy: List[Tuple[datetime, datetime]],
+    buffer_min: int = 5,
+) -> datetime:
+    """
+    Returns a start time >= start_dt that does NOT overlap any busy interval.
+    busy: list of (busy_start, busy_end) datetimes (tz-aware, same tz as start_dt)
+    """
+    t = start_dt  # ✅ always defined
+
+    # assume busy is sorted by start time
+    while True:
+        end_dt = t + timedelta(minutes=duration_min)
+
+        moved = False
+        for b_start, b_end in busy:
+            # no overlap
+            if end_dt <= b_start or t >= b_end:
+                continue
+
+            # overlap → push t to just after this busy block
+            t = b_end + timedelta(minutes=buffer_min)
+            moved = True
+            break
+
+        if not moved:
+            return t
+
 
 def _validate_plan_json(text: str) -> dict:
     obj = _json_load_or_raise(text, "planner/reviser")
@@ -914,6 +947,7 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
     """
     
     busy = busy or []
+    busy_sorted = sorted(busy, key=lambda x: x[0])
 
     def _overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
         return a_start < b_end and a_end > b_start
@@ -939,6 +973,10 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
 
     cursor = now_local + timedelta(minutes=int(start_in_minutes or 0))
     scheduled: List[dict] = []
+    
+    busy = busy or []
+    # ensure busy sorted
+    busy_sorted = sorted(busy, key=lambda x: x[0])
 
     # split
     habits = [it for it in items if it.get("kind") == "habit" and int(it.get("occurrences", 1)) > 1]
@@ -951,8 +989,8 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
 
         dur = int(it.get("minutes", 25))
         start_dt = max(cursor, w_start)
-        start_dt = _shift_to_free(start_dt, dur)   # ✅ avoid conflicts
-        end_dt = start_dt + timedelta(minutes=dur)
+        start_dt = _push_past_busy(start_dt, int(it.get("minutes", 25)), busy_sorted, buffer_min=buffer_minutes)
+        end_dt = start_dt + timedelta(minutes=int(it.get("minutes", 25)))
         
         t = _shift_to_free(t, dur)
 
@@ -995,9 +1033,11 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
         t = start_base
         for _ in range(occ):
             # find next non-conflicting slot
+            t = _push_past_busy(t, dur, busy_sorted, buffer_min=buffer_minutes)
             tries = 0
             while _conflicts(it["title"], t, min_gap) and tries < 10:
                 t = t + timedelta(minutes=15)
+                t = _push_past_busy(t, dur, busy_sorted, buffer_min=buffer_minutes)
                 tries += 1
 
             scheduled.append({
