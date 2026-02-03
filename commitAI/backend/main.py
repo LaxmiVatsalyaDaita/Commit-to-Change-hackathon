@@ -989,10 +989,12 @@ def schedule_daily_items(items: List[dict], *, now_local: datetime, start_in_min
 
         dur = int(it.get("minutes", 25))
         start_dt = max(cursor, w_start)
-        start_dt = _push_past_busy(start_dt, int(it.get("minutes", 25)), busy_sorted, buffer_min=buffer_minutes)
-        end_dt = start_dt + timedelta(minutes=int(it.get("minutes", 25)))
-        
-        t = _shift_to_free(t, dur)
+
+        # pick ONE of these; this is enough:
+        start_dt = _push_past_busy(start_dt, dur, busy_sorted, buffer_min=buffer_minutes)
+
+        end_dt = start_dt + timedelta(minutes=dur)
+
 
         # if it spills beyond window, just keep it (MVP) or clamp later
         scheduled.append({
@@ -2149,13 +2151,6 @@ def daily_revise(req: DailyReviseRequest):
             feedback=req.feedback.strip(),
         )
 
-        schedule = schedule_daily_items(
-            new_plan["items"],
-            now_local=now_local,
-            start_in_minutes=req.start_in_minutes,
-            buffer_minutes=5,
-        )
-
         plan_with_meta = {
             **new_plan,
             "_meta": {
@@ -2268,12 +2263,12 @@ def daily_commit(req: DailyCommitRequest):
 
 
         # 4) recompute schedule at commit time (fresh times)
-        schedule = schedule_daily_items(
-            items,
-            now_local=now_local,
-            start_in_minutes=req.start_in_minutes,
-            buffer_minutes=5,
-        )
+        # schedule = schedule_daily_items(
+        #     items,
+        #     now_local=now_local,
+        #     start_in_minutes=req.start_in_minutes,
+        #     buffer_minutes=5,
+        # )
 
         calendar_events = []
         calendar_error = None
@@ -2483,12 +2478,12 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
         )
 
 
-        schedule = schedule_daily_items(
-            plan["items"],
-            now_local=now_local,
-            start_in_minutes=0,
-            buffer_minutes=buffer,
-        )
+        # schedule = schedule_daily_items(
+        #     plan["items"],
+        #     now_local=now_local,
+        #     start_in_minutes=0,
+        #     buffer_minutes=buffer,
+        # )
 
         # 6) If committed: delete FUTURE events from old schedule and create new ones
         calendar_events = []
