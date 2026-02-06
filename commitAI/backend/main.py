@@ -12,10 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from supabase import create_client, Client
 from openai import OpenAI
-from opik import track, opik_context
+from opik import Opik, track, opik_context
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import Query
+from opik.integrations.openai import track_openai
 
 
 try:
@@ -54,8 +55,14 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY in backend/.env")
 
+opik.configure(project_name=OPIK_PROJECT)
+
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-client = OpenAI(api_key=OPENAI_API_KEY)
+raw_openai_client = OpenAI(api_key=OPENAI_API_KEY)
+client = track_openai(raw_openai_client, project_name=OPIK_PROJECT)
+
+opik_rest = Opik()  
+traces_client = opik_rest.rest_api.traces
 
 # -------------------------
 # FastAPI
@@ -1981,115 +1988,134 @@ def run_autopilot(req: RunAutopilotRequest):
     
 @app.post("/api/run_daily_autopilot")
 def run_daily_autopilot(req: DailyAutopilotRequest):
-    try:
-        tz_name = _safe_tz(req.tz_name)
-        now_local = datetime.now(ZoneInfo(tz_name))
+    with opik.start_as_current_trace("api.run_daily_autopilot", project_name=OPIK_PROJECT) as tr:
+        try:
+            t0 = time.time()
+            req_payload = _dump_model(req)
+
+            # put request on trace (safe helper you already have)
+            _safe_opik_update_trace(
+                input_obj=req_payload,
+                output_obj={},
+                metadata={"phase": "start"},
+                tags=["api", "daily", "draft"],
+            )
+            now_local = datetime.now(ZoneInfo(tz_name))
 
 
-        # load goals (all or subset)
-        q = sb.table("goals").select("id,title,cadence_per_day").eq("user_id", req.user_id)
-        if req.goal_ids:
-            q = q.in_("id", req.goal_ids)
-        goals = q.execute().data or []
-        if not goals:
-            raise HTTPException(status_code=400, detail="No goals found for user")
+            # load goals (all or subset)
+            q = sb.table("goals").select("id,title,cadence_per_day").eq("user_id", req.user_id)
+            if req.goal_ids:
+                q = q.in_("id", req.goal_ids)
+            goals = q.execute().data or []
+            if not goals:
+                raise HTTPException(status_code=400, detail="No goals found for user")
 
-        req_payload = _dump_model(req)
-        memory = _build_daily_memory(sb, req.user_id, goals)
+            req_payload = _dump_model(req)
+            memory = _build_daily_memory(sb, req.user_id, goals)
 
-        plan = daily_planner_llm(req_payload=req_payload, goals=goals, memory=memory)
-        plan = _ensure_item_ids(plan)
-        plan = _inject_habit_items_if_missing(plan, goals)
-        
-        day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
-        busy = _get_non_commitai_busy_intervals(
-            req.user_id,
-            tz_name=tz_name,
-            start_local=now_local,
-            end_local=day_end,
-            buffer_minutes=5,
-        )
+            plan = daily_planner_llm(req_payload=req_payload, goals=goals, memory=memory)
+            plan = _ensure_item_ids(plan)
+            plan = _inject_habit_items_if_missing(plan, goals)
+            
+            day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+            busy = _get_non_commitai_busy_intervals(
+                req.user_id,
+                tz_name=tz_name,
+                start_local=now_local,
+                end_local=day_end,
+                buffer_minutes=5,
+            )
 
-        schedule = schedule_daily_items(
-            plan["items"],
-            now_local=now_local,
-            start_in_minutes=req.start_in_minutes,
-            buffer_minutes=5,
-            busy=busy,  # ✅
-        )
+            schedule = schedule_daily_items(
+                plan["items"],
+                now_local=now_local,
+                start_in_minutes=req.start_in_minutes,
+                buffer_minutes=5,
+                busy=busy,  # ✅
+            )
 
 
-        schedule = schedule_daily_items(
-            plan["items"],
-            now_local=now_local,
-            start_in_minutes=req.start_in_minutes,
-            buffer_minutes=5,
-        )
+            # persist draft
+            plan_with_meta = {
+                **plan,
+                "_meta": {
+                    "status": "DRAFT",
+                    "version": 1,
+                    "tz": tz_name,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
 
-        # persist draft
-        plan_with_meta = {
-            **plan,
-            "_meta": {
+            dr = sb.table("daily_runs").insert({
+                "user_id": req.user_id,
+                "run_date": now_local.date().isoformat(),
+                "state": "DAILY",
+                "selected_agent": "daily",
+                "summary": plan["summary"],
+                "plan_json": plan_with_meta,
+                "schedule_json": schedule,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute().data
+
+            daily_run_id = (dr or [{}])[0].get("id")
+            
+            # after daily_run_id is computed
+            task_rows = []
+            for it in plan["items"]:
+                task_rows.append({
+                    "user_id": req.user_id,
+                    "daily_run_id": daily_run_id,
+                    "item_id": it["item_id"],   # already a UUID string
+                    "title": it["title"],
+                    "details": it.get("details", ""),
+                    "minutes": int(it.get("minutes", 0)) if it.get("minutes") is not None else None,
+                    "kind": it.get("kind", "focus"),
+                    "time_window": it.get("window", "any"),
+                    "goal_ids": it.get("goal_ids", []),
+                    "completed": False,
+                    "completed_at": None,
+                })
+
+            if task_rows:
+                sb.table("daily_tasks").upsert(
+                    task_rows,
+                    on_conflict="daily_run_id,item_id"
+                ).execute()
+
+
+            lat_ms = int((time.time() - t0) * 1000)
+
+            _safe_opik_update_trace(
+                input_obj=req_payload,
+                output_obj={
+                    "daily_run_id": daily_run_id,
+                    "status": "DRAFT",
+                    "summary": plan["summary"],
+                    "items_count": len(plan["items"]),
+                    "schedule_blocks": len(schedule),
+                },
+                metadata={"latency_ms": lat_ms, "tz": tz_name},
+                tags=["api", "daily", "draft"],
+            )
+
+            return {
+                "opik_trace_id": tr.id,   # ✅ add this so you can show judges the trace id
+                "daily_run_id": daily_run_id,
                 "status": "DRAFT",
                 "version": 1,
-                "tz": tz_name,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "summary": plan["summary"],
+                "items": plan["items"],
+                "schedule": schedule,
+                "calendar_events": [],
+                "calendar_error": None,
             }
-        }
-
-        dr = sb.table("daily_runs").insert({
-            "user_id": req.user_id,
-            "run_date": now_local.date().isoformat(),
-            "state": "DAILY",
-            "selected_agent": "daily",
-            "summary": plan["summary"],
-            "plan_json": plan_with_meta,
-            "schedule_json": schedule,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }).execute().data
-
-        daily_run_id = (dr or [{}])[0].get("id")
-        
-        # after daily_run_id is computed
-        task_rows = []
-        for it in plan["items"]:
-            task_rows.append({
-                "user_id": req.user_id,
-                "daily_run_id": daily_run_id,
-                "item_id": it["item_id"],   # already a UUID string
-                "title": it["title"],
-                "details": it.get("details", ""),
-                "minutes": int(it.get("minutes", 0)) if it.get("minutes") is not None else None,
-                "kind": it.get("kind", "focus"),
-                "time_window": it.get("window", "any"),
-                "goal_ids": it.get("goal_ids", []),
-                "completed": False,
-                "completed_at": None,
-            })
-
-        if task_rows:
-            sb.table("daily_tasks").upsert(
-                task_rows,
-                on_conflict="daily_run_id,item_id"
-            ).execute()
 
 
-        # ✅ IMPORTANT: do NOT touch calendar here anymore
-        return {
-            "daily_run_id": daily_run_id,
-            "status": "DRAFT",
-            "version": 1,
-            "summary": plan["summary"],
-            "items": plan["items"],
-            "schedule": schedule,         # preview timeline in UI
-            "calendar_events": [],
-            "calendar_error": None,
-        }
-
-    except (ValidationError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        except (ValidationError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 class DailyReviseRequest(BaseModel):
@@ -2200,66 +2226,76 @@ class DailyCommitRequest(BaseModel):
 
 @app.post("/api/daily/commit")
 def daily_commit(req: DailyCommitRequest):
-    plan: dict = {}  # ✅ always defined (prevents UnboundLocalError)
-    try:
-        # 1) load daily_run FIRST
-        rows = (
-            sb.table("daily_runs")
-            .select("id,user_id,run_date,plan_json")
-            .eq("id", req.daily_run_id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if not rows:
-            raise HTTPException(status_code=404, detail="daily_run not found")
+    with opik.start_as_current_trace("api.daily_commit", project_name=OPIK_PROJECT) as tr:
+        plan: dict = {}  # keep
+        try:
+            t0 = time.time()
+            req_payload = _dump_model(req)
 
-        row = rows[0]
-        if row.get("user_id") != req.user_id:
-            raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
+            _safe_opik_update_trace(
+                input_obj=req_payload,
+                output_obj={},
+                metadata={"phase": "start"},
+                tags=["api", "daily", "commit"],
+            )
+            # 1) load daily_run FIRST
+            rows = (
+                sb.table("daily_runs")
+                .select("id,user_id,run_date,plan_json")
+                .eq("id", req.daily_run_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if not rows:
+                raise HTTPException(status_code=404, detail="daily_run not found")
 
-        plan = row.get("plan_json") or {}
-        items = plan.get("items") or []
-        if not items:
-            raise HTTPException(status_code=400, detail="daily_run has no plan items")
+            row = rows[0]
+            if row.get("user_id") != req.user_id:
+                raise HTTPException(status_code=403, detail="wrong user_id for this daily_run")
 
-        # 2) decide timezone (prefer saved plan meta; fallback to request; then default)
-        meta = (plan.get("_meta") or {})
-        tz_name = _safe_tz(meta.get("tz") or req.tz_name or "America/Detroit")
+            plan = row.get("plan_json") or {}
+            items = plan.get("items") or []
+            if not items:
+                raise HTTPException(status_code=400, detail="daily_run has no plan items")
 
-        if ZoneInfo:
-            now_local = datetime.now(ZoneInfo(tz_name))
-        else:
-            now_local = datetime.now(timezone.utc)
-            tz_name = "UTC"
+            # 2) decide timezone (prefer saved plan meta; fallback to request; then default)
+            meta = (plan.get("_meta") or {})
+            tz_name = _safe_tz(meta.get("tz") or req.tz_name or "America/Detroit")
 
-        # 3) delete TODAY’s commitAI events first (only ours)
-        day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
+            if ZoneInfo:
+                now_local = datetime.now(ZoneInfo(tz_name))
+            else:
+                now_local = datetime.now(timezone.utc)
+                tz_name = "UTC"
 
-        wipe = google_delete_commitai_events_in_range(
-            req.user_id,
-            time_min=day_start,
-            time_max=day_end,
-        )
+            # 3) delete TODAY’s commitAI events first (only ours)
+            day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + timedelta(days=1)
+
+            wipe = google_delete_commitai_events_in_range(
+                req.user_id,
+                time_min=day_start,
+                time_max=day_end,
+            )
         
-        day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
-        busy = _get_non_commitai_busy_intervals(
-            req.user_id,
-            tz_name=tz_name,
-            start_local=now_local,
-            end_local=day_end,
-            buffer_minutes=5,
-        )
+            day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+            busy = _get_non_commitai_busy_intervals(
+                req.user_id,
+                tz_name=tz_name,
+                start_local=now_local,
+                end_local=day_end,
+                buffer_minutes=5,
+            )
 
-        schedule = schedule_daily_items(
-            plan["items"],
-            now_local=now_local,
-            start_in_minutes=req.start_in_minutes,
-            buffer_minutes=5,
-            busy=busy,  # ✅
-        )
+            schedule = schedule_daily_items(
+                plan["items"],
+                now_local=now_local,
+                start_in_minutes=req.start_in_minutes,
+                buffer_minutes=5,
+                busy=busy,  # ✅
+            )
 
 
         # 4) recompute schedule at commit time (fresh times)
@@ -2270,115 +2306,129 @@ def daily_commit(req: DailyCommitRequest):
         #     buffer_minutes=5,
         # )
 
-        calendar_events = []
-        calendar_error = None
+            calendar_events = []
+            calendar_error = None
 
-        # 5) create events
-        try:
-            tz = ZoneInfo(tz_name) if ZoneInfo else timezone.utc
+            # 5) create events
+            try:
+                tz = ZoneInfo(tz_name) if ZoneInfo else timezone.utc
 
+                for blk in schedule:
+                    start_dt = datetime.fromisoformat(blk["start"])
+                    end_dt = datetime.fromisoformat(blk["end"])
+
+                    # ✅ ensure tz-aware
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=tz)
+                    else:
+                        start_dt = start_dt.astimezone(tz)
+
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=tz)
+                    else:
+                        end_dt = end_dt.astimezone(tz)
+
+                    evt = google_create_event(
+                        user_id=req.user_id,
+                        title=f"commitAI: {blk['title']}",
+                        details=blk.get("details", ""),
+                        start=start_dt,
+                        end=end_dt,
+                        time_zone=tz_name,
+                    )
+
+                    calendar_events.append({
+                        "item_id": blk.get("item_id"),
+                        "step_title": blk["title"],
+                        "event_id": evt.get("id"),
+                        "htmlLink": evt.get("htmlLink"),
+                        "start": blk["start"],
+                        "end": blk["end"],
+                    })
+
+                # optional: add quick check-in
+                if schedule:
+                    last_end = datetime.fromisoformat(schedule[-1]["end"])
+                    if last_end.tzinfo is None:
+                        last_end = last_end.replace(tzinfo=tz)
+                    else:
+                        last_end = last_end.astimezone(tz)
+
+                    chk_evt = google_create_event(
+                        user_id=req.user_id,
+                        title="commitAI: quick check-in",
+                        details="Mark what you actually finished. If you're behind, commitAI will adjust the plan.",
+                        start=last_end,
+                        end=last_end + timedelta(minutes=5),
+                        time_zone=tz_name,
+                    )
+                    calendar_events.append({
+                        "item_id": None,
+                        "step_title": "quick check-in",
+                        "event_id": chk_evt.get("id"),
+                        "htmlLink": chk_evt.get("htmlLink"),
+                        "start": last_end.isoformat(),
+                        "end": (last_end + timedelta(minutes=5)).isoformat(),
+                    })
+
+            except Exception as e:
+                calendar_error = str(e)
+
+            # 6) mark committed + store enriched schedule
+            meta = plan.get("_meta") or {}
+            meta["status"] = "COMMITTED"
+            meta["committed_at"] = datetime.now(timezone.utc).isoformat()
+            meta["tz"] = tz_name
+            plan["_meta"] = meta
+
+            ev_by_key = {(e.get("item_id"), e.get("step_title")): e for e in calendar_events}
+
+            enriched_schedule = []
             for blk in schedule:
-                start_dt = datetime.fromisoformat(blk["start"])
-                end_dt = datetime.fromisoformat(blk["end"])
-
-                # ✅ ensure tz-aware
-                if start_dt.tzinfo is None:
-                    start_dt = start_dt.replace(tzinfo=tz)
-                else:
-                    start_dt = start_dt.astimezone(tz)
-
-                if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=tz)
-                else:
-                    end_dt = end_dt.astimezone(tz)
-
-                evt = google_create_event(
-                    user_id=req.user_id,
-                    title=f"commitAI: {blk['title']}",
-                    details=blk.get("details", ""),
-                    start=start_dt,
-                    end=end_dt,
-                    time_zone=tz_name,
-                )
-
-                calendar_events.append({
-                    "item_id": blk.get("item_id"),
-                    "step_title": blk["title"],
-                    "event_id": evt.get("id"),
-                    "htmlLink": evt.get("htmlLink"),
-                    "start": blk["start"],
-                    "end": blk["end"],
+                e = ev_by_key.get((blk.get("item_id"), blk.get("title")))
+                enriched_schedule.append({
+                    **blk,
+                    "event_id": e.get("event_id") if e else None,
+                    "htmlLink": e.get("htmlLink") if e else None,
                 })
 
-            # optional: add quick check-in
-            if schedule:
-                last_end = datetime.fromisoformat(schedule[-1]["end"])
-                if last_end.tzinfo is None:
-                    last_end = last_end.replace(tzinfo=tz)
-                else:
-                    last_end = last_end.astimezone(tz)
+            sb.table("daily_runs").update({
+                "plan_json": plan,
+                "schedule_json": enriched_schedule,
+            }).eq("id", req.daily_run_id).execute()
+            
+            lat_ms = int((time.time() - t0) * 1000)
+            _safe_opik_update_trace(
+                input_obj=req_payload,
+                output_obj={
+                    "status": "COMMITTED",
+                    "daily_run_id": req.daily_run_id,
+                    "events_created": len(calendar_events),
+                    "calendar_error": calendar_error,
+                },
+                metadata={"latency_ms": lat_ms, "tz": tz_name},
+                tags=["api", "daily", "commit"],
+            )
 
-                chk_evt = google_create_event(
-                    user_id=req.user_id,
-                    title="commitAI: quick check-in",
-                    details="Mark what you actually finished. If you're behind, commitAI will adjust the plan.",
-                    start=last_end,
-                    end=last_end + timedelta(minutes=5),
-                    time_zone=tz_name,
-                )
-                calendar_events.append({
-                    "item_id": None,
-                    "step_title": "quick check-in",
-                    "event_id": chk_evt.get("id"),
-                    "htmlLink": chk_evt.get("htmlLink"),
-                    "start": last_end.isoformat(),
-                    "end": (last_end + timedelta(minutes=5)).isoformat(),
-                })
 
+            return {
+                "daily_run_id": req.daily_run_id,
+                "status": "COMMITTED",
+                "summary": plan.get("summary") or "",
+                "items": items,
+                "schedule": enriched_schedule,
+                "calendar_events": calendar_events,
+                "calendar_error": calendar_error,
+                "wipe": wipe,
+                "tz_used": tz_name,
+            }
+
+        except (ValidationError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except HTTPException:
+            raise
         except Exception as e:
-            calendar_error = str(e)
-
-        # 6) mark committed + store enriched schedule
-        meta = plan.get("_meta") or {}
-        meta["status"] = "COMMITTED"
-        meta["committed_at"] = datetime.now(timezone.utc).isoformat()
-        meta["tz"] = tz_name
-        plan["_meta"] = meta
-
-        ev_by_key = {(e.get("item_id"), e.get("step_title")): e for e in calendar_events}
-
-        enriched_schedule = []
-        for blk in schedule:
-            e = ev_by_key.get((blk.get("item_id"), blk.get("title")))
-            enriched_schedule.append({
-                **blk,
-                "event_id": e.get("event_id") if e else None,
-                "htmlLink": e.get("htmlLink") if e else None,
-            })
-
-        sb.table("daily_runs").update({
-            "plan_json": plan,
-            "schedule_json": enriched_schedule,
-        }).eq("id", req.daily_run_id).execute()
-
-        return {
-            "daily_run_id": req.daily_run_id,
-            "status": "COMMITTED",
-            "summary": plan.get("summary") or "",
-            "items": items,
-            "schedule": enriched_schedule,
-            "calendar_events": calendar_events,
-            "calendar_error": calendar_error,
-            "wipe": wipe,
-            "tz_used": tz_name,
-        }
-
-    except (ValidationError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
     
 @app.post("/api/daily/checkin_reschedule")
