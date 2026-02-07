@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from supabase import create_client, Client
 from openai import OpenAI
+import opik
 from opik import Opik, track, opik_context
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -1992,6 +1993,8 @@ def run_daily_autopilot(req: DailyAutopilotRequest):
         try:
             t0 = time.time()
             req_payload = _dump_model(req)
+            
+            tz_name = _safe_tz(req.tz_name)
 
             # put request on trace (safe helper you already have)
             _safe_opik_update_trace(
@@ -2176,6 +2179,26 @@ def daily_revise(req: DailyReviseRequest):
             prev_plan=prev_plan,
             feedback=req.feedback.strip(),
         )
+        
+        new_plan = _ensure_item_ids(new_plan)
+        new_plan = _inject_habit_items_if_missing(new_plan, goals)
+        
+        day_end = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+        busy = _get_non_commitai_busy_intervals(
+            req.user_id,
+            tz_name=tz_name,
+            start_local=now_local,
+            end_local=day_end,
+            buffer_minutes=5,
+        )
+
+        schedule = schedule_daily_items(
+            new_plan["items"],
+            now_local=now_local,
+            start_in_minutes=req.start_in_minutes,
+            buffer_minutes=5,
+            busy=busy,
+        )
 
         plan_with_meta = {
             **new_plan,
@@ -2228,6 +2251,7 @@ class DailyCommitRequest(BaseModel):
 def daily_commit(req: DailyCommitRequest):
     with opik.start_as_current_trace("api.daily_commit", project_name=OPIK_PROJECT) as tr:
         plan: dict = {}  # keep
+        schedule = []
         try:
             t0 = time.time()
             req_payload = _dump_model(req)
@@ -2268,7 +2292,7 @@ def daily_commit(req: DailyCommitRequest):
                 now_local = datetime.now(ZoneInfo(tz_name))
             else:
                 now_local = datetime.now(timezone.utc)
-                tz_name = "UTC"
+                
 
             # 3) delete TODAY’s commitAI events first (only ours)
             day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
