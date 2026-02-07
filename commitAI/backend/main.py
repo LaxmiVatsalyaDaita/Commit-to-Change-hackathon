@@ -36,6 +36,16 @@ from integrations.calendar_google import (
 # -------------------------
 # Env + Clients
 # -------------------------
+
+_OPIK_TRACES_CLIENT = None
+
+def get_opik_traces_client():
+    global _OPIK_TRACES_CLIENT
+    if _OPIK_TRACES_CLIENT is None:
+        _OPIK_TRACES_CLIENT = opik.Opik().rest_client.traces
+    return _OPIK_TRACES_CLIENT
+
+
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -62,8 +72,8 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 raw_openai_client = OpenAI(api_key=OPENAI_API_KEY)
 client = track_openai(raw_openai_client, project_name=OPIK_PROJECT)
 
-opik_rest = Opik()  
-traces_client = opik_rest.rest_api.traces
+# opik_rest = Opik()  
+# traces_client = opik_rest.rest_api.traces
 
 # -------------------------
 # FastAPI
