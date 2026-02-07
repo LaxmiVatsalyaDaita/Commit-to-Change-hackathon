@@ -56,7 +56,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY in backend/.env")
 
-opik.configure(project_name=OPIK_PROJECT)
+opik.configure(workspace=OPIK_PROJECT)
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 raw_openai_client = OpenAI(api_key=OPENAI_API_KEY)
