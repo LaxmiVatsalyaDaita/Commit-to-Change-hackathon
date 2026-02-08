@@ -351,6 +351,21 @@ export default function AppHome() {
     return m;
   }, [goals]);
 
+  const goalCoverage = useMemo(() => {
+    const covered = new Set<string>();
+  
+    for (const it of dailyAutopilot?.items ?? []) {
+      for (const gid of it.goal_ids ?? []) covered.add(gid);
+    }
+    for (const b of dailyAutopilot?.schedule ?? []) {
+      for (const gid of b.goal_ids ?? []) covered.add(gid);
+    }
+  
+    const missing = goals.filter((g) => !covered.has(g.id));
+    return { covered, missing };
+  }, [dailyAutopilot, goals]);
+  
+
   const dailyChecklistStats = useMemo(() => {
     const items = dailyAutopilot?.items ?? [];
     if (!items.length) return { done: 0, total: 0 };
@@ -406,12 +421,15 @@ export default function AppHome() {
   }
 
   async function loadGoals() {
+    if (!userId) return;
     setLoadingGoals(true);
+  
     const { data, error } = await supabase
       .from("goals")
       .select("id,title,cadence_per_day,created_at")
+      .eq("user_id", userId)
       .order("created_at", { ascending: false });
-
+  
     if (error) {
       setMsg(error.message);
       setGoals([]);
@@ -420,6 +438,7 @@ export default function AppHome() {
     }
     setLoadingGoals(false);
   }
+  
 
   async function createGoal(e: React.FormEvent) {
     e.preventDefault();
@@ -428,6 +447,11 @@ export default function AppHome() {
     const cleanTitle = title.trim();
     if (!cleanTitle) {
       setMsg("Goal title is required.");
+      return;
+    }
+
+    if (!userId) {
+      setMsg("Not signed in.");
       return;
     }
 
@@ -897,6 +921,48 @@ export default function AppHome() {
                     </div>
                   </div>
                 </div>
+
+                {goalCoverage.missing.length > 0 && (
+                <div className="mb-6 p-5 rounded-2xl border-3 border-amber-300 bg-gradient-to-r from-amber-50 to-yellow-50 text-amber-900 shadow-lg">
+                  <div className="font-black text-lg flex items-center gap-2">
+                    <span className="text-2xl">⚠️</span>
+                    Some goals weren’t scheduled today
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {goalCoverage.missing.map((g) => (
+                      <span
+                        key={g.id}
+                        className="inline-flex items-center gap-2 text-sm bg-white px-4 py-2 rounded-full border-2 border-amber-200 font-bold"
+                      >
+                        🎯 {g.title}
+                      </span>
+                    ))}
+                  </div>
+
+                  <div className="mt-4 text-sm font-semibold opacity-90">
+                    This usually means the backend planner didn’t generate tasks (or didn’t attach <code>goal_ids</code>) for these goals.
+                  </div>
+
+                  <div className="mt-4 flex gap-3 flex-wrap">
+                    <button
+                      className="px-6 py-3 rounded-2xl bg-gradient-to-r from-amber-600 to-orange-600 text-white font-black shadow-lg hover:scale-105 active:scale-95 transition"
+                      onClick={runAutopilotAllGoals}
+                      disabled={runningAutopilot}
+                    >
+                      🔁 Re-run planner
+                    </button>
+
+                    <button
+                      className="px-6 py-3 rounded-2xl border-2 border-amber-400 bg-white text-amber-800 font-black hover:bg-amber-50 transition"
+                      onClick={() => setTab("goals")}
+                    >
+                      ✏️ Review goals
+                    </button>
+                  </div>
+                </div>
+              )}
+
 
                 <div className="flex items-center justify-between gap-4 flex-wrap mb-8">
                   <label className="flex items-center gap-4 bg-white border-3 border-gray-300 rounded-2xl px-6 py-4 shadow-xl hover:shadow-2xl transition-all duration-300 hover:scale-105">

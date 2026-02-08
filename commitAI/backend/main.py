@@ -37,7 +37,7 @@ from integrations.calendar_google import (
 # Env + Clients
 # -------------------------
 
-# _OPIK_TRACES_CLIENT = None
+_OPIK_TRACES_CLIENT = None
 
 # def get_opik_traces_client():
 #     global _OPIK_TRACES_CLIENT
@@ -279,6 +279,25 @@ def _stabilize_item_ids(prev_items: list[dict], new_items: list[dict]) -> list[d
             it["item_id"] = idx[key]
 
     return new_items
+
+def _done_goal_ids_from_completed(prev_items: List[dict], completed_ids: List[str]) -> List[str]:
+    completed = set(completed_ids or [])
+    by_goal: Dict[str, List[str]] = {}
+
+    for it in prev_items or []:
+        iid = it.get("item_id")
+        if not iid:
+            continue
+        for gid in (it.get("goal_ids") or []):
+            if gid:
+                by_goal.setdefault(gid, []).append(iid)
+
+    done = []
+    for gid, iids in by_goal.items():
+        if iids and all(i in completed for i in iids):
+            done.append(gid)
+    return done
+
 
 
 def _to_local_naive(dt: datetime, tz_name: str) -> datetime:
@@ -674,14 +693,59 @@ def schedule_calendar_from_steps(
 
     return calendar_events, calendar_error
 
+def _stable_item_uuid(goal_ids: List[str], kind: str, title: str) -> str:
+    """
+    Deterministic id so habits / recurring items don't get a new UUID every reschedule.
+    """
+    gids = ",".join(sorted([g for g in (goal_ids or []) if g]))
+    k = (kind or "focus").strip().lower()
+    t = (title or "").strip().lower()
+    key = f"{gids}|{k}|{t}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
 def _ensure_item_ids(plan: dict) -> dict:
-    """Ensure each daily item has a stable id for checklist + calendar mapping."""
+    """
+    Ensure each daily item has a stable-ish id for checklist + calendar mapping.
+    - If LLM omitted item_id, generate:
+        - deterministic uuid5 for habits and single-goal items
+        - uuid4 for multi-goal focus items (more likely to be new/unique)
+    - Ensure uniqueness even if the model duplicates titles.
+    """
     items = plan.get("items") or []
+    seen = set()
+
     for it in items:
         if not it.get("item_id"):
-            it["item_id"] = str(uuid.uuid4())
+            kind = (it.get("kind") or "focus")
+            gids = it.get("goal_ids") or []
+            title = it.get("title") or ""
+
+            if kind == "habit" or len(gids) == 1:
+                base = _stable_item_uuid(gids, kind, title)
+            else:
+                base = str(uuid.uuid4())
+
+            it["item_id"] = base
+
+        # enforce uniqueness (avoid accidental collisions)
+        if it["item_id"] in seen:
+            # deterministic "suffix" to break ties while staying stable-ish
+            kind = (it.get("kind") or "focus")
+            gids = it.get("goal_ids") or []
+            title = it.get("title") or ""
+            n = 2
+            new_id = _stable_item_uuid(gids, kind, f"{title}#{n}")
+            while new_id in seen:
+                n += 1
+                new_id = _stable_item_uuid(gids, kind, f"{title}#{n}")
+            it["item_id"] = new_id
+
+        seen.add(it["item_id"])
+
     plan["items"] = items
     return plan
+
 
 def _build_daily_memory(sb: Client, user_id: str, goals: List[dict]) -> str:
     """Combine memory across goals (MVP)."""
@@ -720,7 +784,7 @@ def _inject_habit_items_if_missing(plan: dict, goals: List[dict]) -> dict:
         if is_habit:
             occ = min(max(cadence, 3), 8)  # cap for noise control
             items.append({
-                "item_id": str(uuid.uuid4()),
+                "item_id": _stable_item_uuid([gid], "habit", f"{g.get('title')} (check-in)"),
                 "title": f"{g.get('title')} (check-in)",
                 "minutes": 2,
                 "details": "Quick 10-second action. Log it immediately so the plan stays accurate.",
@@ -733,7 +797,7 @@ def _inject_habit_items_if_missing(plan: dict, goals: List[dict]) -> dict:
         else:
             # fallback: at least one focus item
             items.append({
-                "item_id": str(uuid.uuid4()),
+                "item_id": _stable_item_uuid([gid], "focus", f"Progress on: {g.get('title')}"),
                 "title": f"Progress on: {g.get('title')}",
                 "minutes": 25,
                 "details": "Do the smallest meaningful next step.",
@@ -1168,6 +1232,7 @@ def daily_today(user_id: str, tz_name: str = "America/Detroit"):
 
     plan = chosen.get("plan_json") or {}
     items = plan.get("items") or []
+    plan_item_ids = {it.get("item_id") for it in items if it.get("item_id")}
     schedule = chosen.get("schedule_json") or []
     
     tasks = (
@@ -1180,6 +1245,15 @@ def daily_today(user_id: str, tz_name: str = "America/Detroit"):
         .data
         or []
     )
+    # only return tasks that exist in current plan
+    tasks = [t for t in tasks if t.get("item_id") in plan_item_ids]
+    task_by_id = {t["item_id"]: t for t in tasks if t.get("item_id")}
+    for it in items:
+        t = task_by_id.get(it.get("item_id"))
+        it["completed"] = bool(t.get("completed")) if t else False
+        it["completed_at"] = t.get("completed_at") if t else None
+
+
 
     for t in tasks:
         t["window"] = t.get("time_window")
@@ -1442,6 +1516,7 @@ def daily_rescheduler_llm(
     memory: str,
     prev_plan: dict,
     completed_item_ids: List[str],
+    done_goal_ids: List[str], 
     now_local_iso: str,
 ) -> dict:
     """
@@ -1494,6 +1569,7 @@ Hard rules:
 - Habits (like water) should be kind="habit" with occurrences>1 and min_gap_minutes>=90.
 - Cover all goals reasonably: every goal should appear in at least one remaining item (unless the day is clearly overloaded — then keep at least the most important per goal).
 - Max 20 items. JSON only. No markdown. No extra keys.
+- DO NOT create new items for goal_ids listed in done_goal_ids.
 
 Now (local): {now_local_iso}
 
@@ -2606,6 +2682,22 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
 
         completed_ids = list(dict.fromkeys(req.completed_item_ids or []))  # stable unique
         
+        db_done = (
+            sb.table("daily_tasks")
+            .select("item_id")
+            .eq("user_id", req.user_id)
+            .eq("daily_run_id", req.daily_run_id)
+            .eq("completed", True)
+            .execute()
+            .data
+            or []
+        )
+        db_completed_ids = [r.get("item_id") for r in db_done if r.get("item_id")]
+
+        completed_set = set(completed_ids) | set(db_completed_ids)
+        completed_ids = list(completed_set)
+
+        
         # after: prev_items = prev_plan.get("items") or []
         # after: completed_ids = list(dict.fromkeys(req.completed_item_ids or []))
 
@@ -2652,7 +2744,9 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
                 "calendar_error": None,
             }
 
+        done_goal_ids = _done_goal_ids_from_completed(prev_items, completed_ids)
 
+        
         # 4) LLM revise remaining items
         plan = daily_rescheduler_llm(
             req_payload=req_payload,
@@ -2660,12 +2754,50 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
             memory=memory,
             prev_plan=prev_plan,
             completed_item_ids=completed_ids,
+            done_goal_ids=done_goal_ids,
             now_local_iso=now_local_iso,
         )
         plan_items = plan.get("items") or []
         plan["items"] = _stabilize_item_ids(prev_items, plan_items)
         plan = _ensure_item_ids(plan)
         plan = _inject_habit_items_if_missing(plan, goals)
+        
+        # ✅ Sync daily_tasks table to match the updated plan (this fixes "progress not saved")
+        existing_tasks = (
+            sb.table("daily_tasks")
+            .select("item_id,completed,completed_at")
+            .eq("user_id", req.user_id)
+            .eq("daily_run_id", req.daily_run_id)
+            .execute()
+            .data
+            or []
+        )
+        existing_by_id = {t["item_id"]: t for t in existing_tasks if t.get("item_id")}
+
+        now_utc_iso = datetime.now(timezone.utc).isoformat()
+        task_rows = []
+        for it in plan.get("items") or []:
+            iid = it.get("item_id")
+            prev = existing_by_id.get(iid) or {}
+            is_done = bool(prev.get("completed")) or (iid in completed_set)
+
+            task_rows.append({
+                "user_id": req.user_id,
+                "daily_run_id": req.daily_run_id,
+                "item_id": iid,
+                "title": it.get("title"),
+                "details": it.get("details", ""),
+                "minutes": int(it.get("minutes", 0)) if it.get("minutes") is not None else None,
+                "kind": it.get("kind", "focus"),
+                "time_window": it.get("window", "any"),
+                "goal_ids": it.get("goal_ids", []),
+                "completed": is_done,
+                "completed_at": (prev.get("completed_at") or (now_utc_iso if is_done else None)),
+            })
+
+        if task_rows:
+            sb.table("daily_tasks").upsert(task_rows, on_conflict="daily_run_id,item_id").execute()
+
 
         # 5) schedule deterministically from now (start_in_minutes = 0)
         buffer = 10 if int(req.workload) >= 4 else 5
