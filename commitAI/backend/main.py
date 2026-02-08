@@ -1932,31 +1932,6 @@ def run_autopilot_traced(req: RunAutopilotRequest) -> dict:
 # -------------------------
 # Calendar scheduling helper
 # -------------------------
-from fastapi import APIRouter, Request
-from fastapi.responses import RedirectResponse
-from urllib.parse import urlencode
-import os
-
-router = APIRouter()
-
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")  # set on Render
-
-@router.get("/api/integrations/google/callback")
-async def google_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
-    # If Google returned an error (user cancelled, etc.)
-    if error:
-        q = urlencode({"google": "error", "reason": error})
-        return RedirectResponse(url=f"{FRONTEND_URL}/app?{q}", status_code=302)
-
-    # ✅ verify state, exchange code for tokens, store tokens...
-    ok = await verify_state_somehow(state)  # <- your logic
-    if not ok:
-        q = urlencode({"google": "error", "reason": "invalid_state"})
-        return RedirectResponse(url=f"{FRONTEND_URL}/app?{q}", status_code=302)
-
-    # ✅ success
-    q = urlencode({"google": "connected"})
-    return RedirectResponse(url=f"{FRONTEND_URL}/app?{q}", status_code=302)
 
 def schedule_plan_to_calendar(
     *,
