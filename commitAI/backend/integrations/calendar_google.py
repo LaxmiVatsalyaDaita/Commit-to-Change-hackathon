@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
+from fastapi.responses import RedirectResponse
 
 from fastapi import APIRouter, HTTPException
 from supabase import Client
@@ -14,7 +15,7 @@ from supabase import Client
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
-FRONTEND_APP_URL = os.getenv("https://committochange.vercel.app/app", "http://localhost:3000")
+FRONTEND_APP_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 STATE_TTL_SECONDS = 10 * 60  # 10 minutes
 
