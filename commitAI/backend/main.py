@@ -226,8 +226,9 @@ class DailyRescheduleRequest(BaseModel):
     workload: int = Field(ge=1, le=5)
     blockers: Optional[str] = None
     completed_item_ids: List[str] = []
-    tz_name: Optional[str] = None
     start_in_minutes: int = Field(default=0, ge=0, le=180)
+    tz_name: Optional[str] = None
+    
 
 
 
@@ -1168,15 +1169,32 @@ def daily_today(user_id: str, tz_name: str = "America/Detroit"):
     plan = chosen.get("plan_json") or {}
     items = plan.get("items") or []
     schedule = chosen.get("schedule_json") or []
+    
+    tasks = (
+        sb.table("daily_tasks")
+        .select("item_id,completed,completed_at,title,minutes,kind,time_window,goal_ids,details")
+        .eq("user_id", user_id)
+        .eq("daily_run_id", chosen.get("id"))
+        .order("created_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+
+    for t in tasks:
+        t["window"] = t.get("time_window")
+        t.pop("time_window", None)
+
 
     return {
         "found": True,
         "daily_run_id": chosen.get("id"),
         "summary": plan.get("summary") or "",
         "items": items,
+        "tasks": tasks, 
         "schedule": schedule,
-        "calendar_events": [],   # optional
-        "calendar_error": None,  # optional
+        "calendar_events": [],   
+        "calendar_error": None,  
         "status": ((plan.get("_meta") or {}).get("status") or "DRAFT"),
         "version": int(((plan.get("_meta") or {}).get("version") or 1)),
     }
@@ -2269,6 +2287,29 @@ def daily_revise(req: DailyReviseRequest):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute().data
         new_id = (dr or [{}])[0].get("id")
+        
+        task_rows = []
+        for it in new_plan["items"]:
+            task_rows.append({
+                "user_id": req.user_id,
+                "daily_run_id": new_id,
+                "item_id": it["item_id"],
+                "title": it["title"],
+                "details": it.get("details", ""),
+                "minutes": int(it.get("minutes", 0)) if it.get("minutes") is not None else None,
+                "kind": it.get("kind", "focus"),
+                "time_window": it.get("window", "any"),
+                "goal_ids": it.get("goal_ids", []),
+                "completed": False,
+                "completed_at": None,
+            })
+
+        if task_rows:
+            sb.table("daily_tasks").upsert(
+                task_rows,
+                on_conflict="daily_run_id,item_id"
+            ).execute()
+
 
         return {
             "daily_run_id": new_id,
