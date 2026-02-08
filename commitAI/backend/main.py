@@ -2538,6 +2538,53 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
         memory = _build_daily_memory(sb, req.user_id, goals)
 
         completed_ids = list(dict.fromkeys(req.completed_item_ids or []))  # stable unique
+        
+        # after: prev_items = prev_plan.get("items") or []
+        # after: completed_ids = list(dict.fromkeys(req.completed_item_ids or []))
+
+        prev_item_ids = [it.get("item_id") for it in prev_items if it.get("item_id")]
+        completed_set = set(completed_ids)
+
+        remaining_ids = [iid for iid in prev_item_ids if iid not in completed_set]
+
+        if len(prev_item_ids) > 0 and len(remaining_ids) == 0:
+            # ✅ Everything is done → mark day DONE and stop generating new plans
+            next_version = int(prev_meta.get("version") or 1) + 1
+            new_meta = {
+                **prev_meta,
+                "status": "DONE",
+                "version": next_version,
+                "tz": tz_name,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "checkin_snapshot": {
+                    "energy": req.energy,
+                    "workload": req.workload,
+                    "blockers": (req.blockers or "")[:500],
+                    "completed_item_ids": completed_ids,
+                    "now_local": now_local_iso,
+                },
+            }
+
+            plan_to_store = {**prev_plan, "_meta": new_meta}
+
+            sb.table("daily_runs").update({
+                "plan_json": plan_to_store,
+                "summary": prev_plan.get("summary") or "",
+                # keep schedule_json as-is (or you can wipe it)
+                "schedule_json": prev_schedule,
+            }).eq("id", req.daily_run_id).execute()
+
+            return {
+                "daily_run_id": req.daily_run_id,
+                "status": "DONE",
+                "version": next_version,
+                "summary": prev_plan.get("summary") or "",
+                "items": prev_items,
+                "schedule": prev_schedule,
+                "calendar_events": [],
+                "calendar_error": None,
+            }
+
 
         # 4) LLM revise remaining items
         plan = daily_rescheduler_llm(
