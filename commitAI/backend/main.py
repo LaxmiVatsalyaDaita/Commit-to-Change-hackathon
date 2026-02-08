@@ -253,6 +253,32 @@ def _ensure_tz_aware(dt: datetime, tz_name: str) -> datetime:
         return dt.replace(tzinfo=tz)
     return dt.astimezone(tz)
 
+def _stabilize_item_ids(prev_items: list[dict], new_items: list[dict]) -> list[dict]:
+    # Build an index from previous items → item_id
+    idx = {}
+    for it in prev_items or []:
+        key = (
+            tuple(sorted(it.get("goal_ids") or [])),
+            (it.get("title") or "").strip().lower(),
+            it.get("kind") or "focus",
+        )
+        if it.get("item_id"):
+            idx[key] = it["item_id"]
+
+    # Reuse ids where LLM forgot them
+    for it in new_items or []:
+        if it.get("item_id"):
+            continue
+        key = (
+            tuple(sorted(it.get("goal_ids") or [])),
+            (it.get("title") or "").strip().lower(),
+            it.get("kind") or "focus",
+        )
+        if key in idx:
+            it["item_id"] = idx[key]
+
+    return new_items
+
 
 def _to_local_naive(dt: datetime, tz_name: str) -> datetime:
     """
@@ -2595,6 +2621,8 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
             completed_item_ids=completed_ids,
             now_local_iso=now_local_iso,
         )
+        plan_items = plan.get("items") or []
+        plan["items"] = _stabilize_item_ids(prev_items, plan_items)
         plan = _ensure_item_ids(plan)
         plan = _inject_habit_items_if_missing(plan, goals)
 
