@@ -748,7 +748,7 @@ export default function AppHome() {
           <div className="mb-6 grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="bg-gradient-to-br from-yellow-400 to-orange-500 rounded-2xl p-5 text-white shadow-xl hover:scale-105 transition-transform duration-300">
               <div className="text-3xl font-black">🔥 {streak}</div>
-              <div className="text-sm font-semibold mt-1 opacity-90">Productivity Streak</div>
+              <div className="text-sm font-semibold mt-1 opacity-90">Progress Level</div>
             </div>
             <div className="bg-gradient-to-br from-emerald-400 to-green-500 rounded-2xl p-5 text-white shadow-xl hover:scale-105 transition-transform duration-300">
               <div className="text-3xl font-black">✅ {dailyChecklistStats.done}</div>

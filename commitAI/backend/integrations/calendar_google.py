@@ -14,6 +14,7 @@ from supabase import Client
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+FRONTEND_APP_URL = os.getenv("https://committochange.vercel.app/app", "http://localhost:3000")
 
 STATE_TTL_SECONDS = 10 * 60  # 10 minutes
 
@@ -205,7 +206,10 @@ def google_callback(code: str, state: str):
         },
     )
 
-    return {"ok": True}
+    return RedirectResponse(
+        url=f"{FRONTEND_APP_URL}/app?tab=calendar&connected=1",
+        status_code=302,
+    )
 
 
 # -------------------------
