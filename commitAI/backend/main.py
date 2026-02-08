@@ -37,13 +37,13 @@ from integrations.calendar_google import (
 # Env + Clients
 # -------------------------
 
-_OPIK_TRACES_CLIENT = None
+# _OPIK_TRACES_CLIENT = None
 
-def get_opik_traces_client():
-    global _OPIK_TRACES_CLIENT
-    if _OPIK_TRACES_CLIENT is None:
-        _OPIK_TRACES_CLIENT = opik.Opik().rest_client.traces
-    return _OPIK_TRACES_CLIENT
+# def get_opik_traces_client():
+#     global _OPIK_TRACES_CLIENT
+#     if _OPIK_TRACES_CLIENT is None:
+#         _OPIK_TRACES_CLIENT = opik.Opik().rest_client.traces
+#     return _OPIK_TRACES_CLIENT
 
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
@@ -51,6 +51,14 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), overrid
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPIK_PROJECT = os.getenv("OPIK_PROJECT_NAME", "commitAI")
+
+opik_client = Opik(project_name=OPIK_PROJECT)
+
+def get_opik_traces_client():
+    global _OPIK_TRACES_CLIENT
+    if _OPIK_TRACES_CLIENT is None:
+        _OPIK_TRACES_CLIENT = opik_client.rest_client.traces
+    return _OPIK_TRACES_CLIENT
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -219,6 +227,8 @@ class DailyRescheduleRequest(BaseModel):
     blockers: Optional[str] = None
     completed_item_ids: List[str] = []
     tz_name: Optional[str] = None
+    start_in_minutes: int = Field(default=0, ge=0, le=180)
+
 
 
 # -------------------------
@@ -2552,6 +2562,9 @@ def daily_checkin_reschedule(req: DailyRescheduleRequest):
             end_local=day_end,
             buffer_minutes=5,
         )
+        
+        start_in = int(getattr(req, "start_in_minutes", 0) or 0)
+        buffer = 10 if int(req.workload) >= 4 else 5  
 
         schedule = schedule_daily_items(
             plan["items"],
